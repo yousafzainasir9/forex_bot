@@ -351,6 +351,7 @@ class Bot:
                 "stop_loss": plan.stop_loss, "take_profit": plan.take_profit,
                 "stop_distance": plan.stop_distance, "entry": plan.entry_price,
                 "risk_amount": plan.risk_amount, "reason_open": plan.reason,
+                "open_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             })
             return True
         return False
@@ -407,6 +408,8 @@ class Bot:
                 self._partial_tp_check(p)
             if self.s.ride_trend_after_tp:
                 self._trend_ride_check(p)
+            if self.s.max_bars_in_trade > 0:
+                self._time_exit_check(p)
 
         # --- 2) Open new positions per scan_mode. ---
         # Session filter: only OPEN new positions inside the configured UTC window.
@@ -522,13 +525,17 @@ class Bot:
             m = self.mon._read_open_map()
             m[key] = {**m.get(key, {}), **info}
             self.mon._write_open_map(m)
+        # Move the remainder's stop to LOCK lock_profit_r of profit (0 = break-even).
+        lock_sl = (p.entry + sd * self.s.lock_profit_r if p.side is PositionSide.LONG
+                   else p.entry - sd * self.s.lock_profit_r)
         self.mon.info(
             f"{p.symbol}: partial take-profit — banked {close_vol} lots @ "
-            f"{round(target, 5)} ({self.s.partial_tp_r:g}R); moving remainder to break-even.")
+            f"{round(target, 5)} ({self.s.partial_tp_r:g}R); locking remainder at "
+            f"{round(lock_sl, 5)} (+{self.s.lock_profit_r:g}R).")
         try:
-            self.execu.modify_sl_tp(p.ticket, stop_loss=p.entry, take_profit=0.0)
+            self.execu.modify_sl_tp(p.ticket, stop_loss=round(lock_sl, 5), take_profit=0.0)
         except Exception as e:
-            self.mon.warning(f"{p.symbol}: break-even move after partial failed: {e}")
+            self.mon.warning(f"{p.symbol}: profit-lock move after partial failed: {e}")
 
     def _trend_ride_check(self, p) -> None:
         """Once a position reaches its target, ride the trend: hold while each new
@@ -565,18 +572,22 @@ class Bot:
             self.mon._write_open_map(m)
             self.mon.info(f"{p.symbol}: target {tp} reached — trend-riding "
                           f"(won't close until a turning {self.s.timeframe} bar).")
-            # H3: lock in break-even. Once the target is reached the broker stop is
-            # moved to entry, so a reversal while riding can no longer turn a winner
-            # into a full-size loss. (Without this, removing the TP to ride leaves
-            # only the original ATR stop — profit could fully round-trip.)
+            # Once the target is reached, move the broker stop to LOCK lock_profit_r
+            # of profit (0 = break-even), so a reversal while riding can no longer turn
+            # a winner into a loss. (Without this, removing the TP to ride leaves only
+            # the original ATR stop — profit could fully round-trip.)
+            sd = float(info.get("stop_distance", 0) or 0)
+            lock_sl = (p.entry + sd * self.s.lock_profit_r if p.side is PositionSide.LONG
+                       else p.entry - sd * self.s.lock_profit_r)
             try:
-                res = self.execu.modify_sl_tp(p.ticket, stop_loss=p.entry, take_profit=0.0)
+                res = self.execu.modify_sl_tp(p.ticket, stop_loss=round(lock_sl, 5), take_profit=0.0)
                 if res.ok:
-                    self.mon.info(f"{p.symbol}: stop moved to break-even @ {p.entry} (riding).")
+                    self.mon.info(f"{p.symbol}: stop moved to lock +{self.s.lock_profit_r:g}R "
+                                  f"@ {round(lock_sl, 5)} (riding).")
                 else:
-                    self.mon.warning(f"{p.symbol}: break-even stop move rejected: {res.detail}")
+                    self.mon.warning(f"{p.symbol}: profit-lock stop move rejected: {res.detail}")
             except Exception as e:
-                self.mon.warning(f"{p.symbol}: break-even stop move failed: {e}")
+                self.mon.warning(f"{p.symbol}: profit-lock stop move failed: {e}")
 
         # Ongoing ATR trailing while riding: ratchet the broker stop in our favour so
         # a deep reversal gives back less than a full round-trip. Only moves the stop
@@ -609,6 +620,31 @@ class Bot:
 
         if dec.should_close:
             self.mon.info(f"{p.symbol}: {dec.reason} — closing.")
+            self.execu.close_position(p.ticket)
+
+    def _time_exit_check(self, p) -> None:
+        """Force-close a position that NEVER reached its target or partial and has
+        been open longer than max_bars_in_trade bars — frees capital from trades that
+        are going nowhere. Riding winners (tp_reached / partial_done) are EXEMPT so a
+        runner is never cut short. Best-effort; never breaks the loop."""
+        _key, info, _ = self._open_entry(p)
+        if info.get("tp_reached") or info.get("partial_done"):
+            return  # don't cut a progressing/riding trade short
+        open_utc = info.get("open_utc")
+        if not open_utc:
+            return  # no recorded open time (e.g. externally opened) — skip
+        try:
+            opened = datetime.fromisoformat(open_utc)
+            if opened.tzinfo is None:
+                opened = opened.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            return
+        tf_secs = _TF_SECONDS.get(self.s.timeframe, 300)
+        bars_open = (datetime.now(timezone.utc) - opened).total_seconds() / tf_secs
+        if bars_open >= self.s.max_bars_in_trade:
+            self.mon.info(
+                f"{p.symbol}: time-exit — open ~{bars_open:.0f} bars "
+                f">= {self.s.max_bars_in_trade} with no target reached; closing.")
             self.execu.close_position(p.ticket)
 
     def _signal_for(self, symbol: str):

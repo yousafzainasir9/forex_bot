@@ -354,6 +354,8 @@ uv run pytest -q
 | `TRAIL_AFTER_TP` / `TRAIL_ATR_MULT` | `true` / `1.5` | After target, trail the stop by ATR × mult (on top of break-even). |
 | `PARTIAL_TP_ENABLED` | `true` | Bank part of the position at the partial target, ride the rest. |
 | `PARTIAL_TP_FRACTION` / `PARTIAL_TP_R` | `0.5` / `1.0` | Fraction to bank, and the partial target distance in R (stop multiples). |
+| `LOCK_PROFIT_R` | `0.8` | Once target/partial hit, move stop to lock this many R of profit (0 = break-even). |
+| `MAX_BARS_IN_TRADE` | `0` | Force-close a trade that never reached target after this many bars (0 = off; riding winners exempt). |
 | `ATR_PERIOD` | `14` | ATR lookback for stop sizing. |
 | `ATR_MULTIPLIER` | `1.5` | Stop distance = ATR × this. Higher = wider stop, smaller size. |
 | `RISK_REWARD` | `1.5` | Take-profit distance as a multiple of the stop distance. |

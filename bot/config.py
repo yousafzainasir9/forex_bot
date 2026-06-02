@@ -174,6 +174,8 @@ class Settings:
     partial_tp_enabled: bool    # bank part of the position at partial_tp_r, ride the rest
     partial_tp_fraction: float  # fraction of the position to close at the partial target (0..1)
     partial_tp_r: float         # partial target distance, in R (multiples of the stop distance)
+    lock_profit_r: float        # once target hit, move stop to LOCK this many R of profit (0 = break-even)
+    max_bars_in_trade: int      # force-close a trade that NEVER reached target after this many bars (0 = off)
 
     # --- Runtime ---
     history_bars: int           # how many candles to pull each cycle
@@ -271,6 +273,8 @@ class Settings:
             partial_tp_enabled=_env_bool("PARTIAL_TP_ENABLED", True),
             partial_tp_fraction=_env_float("PARTIAL_TP_FRACTION", 0.5),
             partial_tp_r=_env_float("PARTIAL_TP_R", 1.0),
+            lock_profit_r=_env_float("LOCK_PROFIT_R", 0.8),
+            max_bars_in_trade=_env_int("MAX_BARS_IN_TRADE", 0) or 0,
             history_bars=_env_int("HISTORY_BARS", 600) or 600,
             magic_number=_env_int("MAGIC_NUMBER", 250531) or 250531,
             deviation_points=_env_int("DEVIATION_POINTS", 20) or 20,
@@ -358,6 +362,10 @@ class Settings:
             )
         if self.partial_tp_r <= 0:
             raise RuntimeError("partial_tp_r must be positive.")
+        if self.lock_profit_r < 0:
+            raise RuntimeError("lock_profit_r cannot be negative.")
+        if self.max_bars_in_trade < 0:
+            raise RuntimeError("max_bars_in_trade cannot be negative.")
         if not (0 <= self.session_start_hour <= 23):
             raise RuntimeError(
                 f"session_start_hour ({self.session_start_hour}) must be 0-23."

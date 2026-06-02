@@ -173,6 +173,8 @@ def run_backtest(
     partial_tp_enabled: bool = False,
     partial_tp_fraction: float = 0.5,
     partial_tp_r: float = 1.0,
+    lock_profit_r: float = 0.0,
+    max_bars_in_trade: int = 0,
 ) -> BacktestResult:
     """Replay ``df`` (OHLC, UTC DatetimeIndex) through the live strategy + risk code.
 
@@ -279,7 +281,12 @@ def run_backtest(
                         eq_points.append((bar_time, equity))
                         pos["lots"] = rem
                         pos["partial_done"] = True
-                        pos["sl"] = pos["entry"]  # remainder to break-even
+                        # Move the remainder's stop to LOCK lock_profit_r of profit
+                        # (0 = break-even). Only ever ratchets the protective way.
+                        ldirn = 1.0 if pos["side"] is PositionSide.LONG else -1.0
+                        lock_sl = pos["entry"] + ldirn * lock_profit_r * pos["stop_distance"]
+                        pos["sl"] = (max(pos["sl"], lock_sl) if pos["side"] is PositionSide.LONG
+                                     else min(pos["sl"], lock_sl))
                         if daily_obj().loss_fraction() >= max_daily_loss:
                             halted = True
 
@@ -302,7 +309,11 @@ def run_backtest(
                 )
                 if dec.tp_reached and not pos.get("tp_reached", False):
                     pos["tp_reached"] = True
-                    pos["sl"] = pos["entry"]  # H3: lock in break-even once target hit
+                    # Lock lock_profit_r of profit once target hit (0 = break-even).
+                    ldirn = 1.0 if pos["side"] is PositionSide.LONG else -1.0
+                    lock_sl = pos["entry"] + ldirn * lock_profit_r * pos["stop_distance"]
+                    pos["sl"] = (max(pos["sl"], lock_sl) if pos["side"] is PositionSide.LONG
+                                 else min(pos["sl"], lock_sl))
                 # ATR trailing once the target is reached: ratchet the stop in the
                 # trade's favour so a deep reversal gives back less. Takes effect on
                 # the NEXT bar (sl is updated after this bar's stop check).
@@ -315,6 +326,15 @@ def run_backtest(
                             pos["sl"] = min(pos["sl"], float(bar["close"]) + trail_atr_mult * bar_atr)
                 if dec.should_close:
                     exit_price, reason = float(bar["close"]), "trend-ride"
+
+            # Time-exit: a trade that NEVER made meaningful progress (no target, no
+            # partial) and has dragged on past max_bars_in_trade closes at market to
+            # free capital. Riding winners (tp_reached/partial_done) are EXEMPT so a
+            # runner is never cut short.
+            if (exit_price is None and max_bars_in_trade > 0
+                    and not pos.get("tp_reached") and not pos.get("partial_done")
+                    and (i - pos.get("entry_i", i)) >= max_bars_in_trade):
+                exit_price, reason = float(bar["close"]), "time-exit"
 
             if exit_price is not None:
                 pnl = _close_pnl(pos, exit_price, spec, costs)
@@ -386,7 +406,7 @@ def run_backtest(
                         "lots": plan.lots, "risk_amount": plan.risk_amount,
                         "open_time": enriched.index[i + 1], "reason_open": plan.reason,
                         "tp_reached": False, "stop_distance": dist,
-                        "partial_done": False,
+                        "partial_done": False, "entry_i": i + 1,
                     }
 
     # Close any still-open position at the last bar's close (mark-to-market exit).
@@ -833,6 +853,7 @@ def main(argv=None) -> int:
     sess_start, sess_end = 7, 16
     trail, trail_mult = False, 1.5
     ptp_on, ptp_frac, ptp_r = False, 0.5, 1.0
+    lock_r, max_bars = 0.0, 0
     try:
         from .config import Settings
         _s = Settings.load()
@@ -844,6 +865,7 @@ def main(argv=None) -> int:
         sess_start, sess_end = _s.session_start_hour, _s.session_end_hour
         trail, trail_mult = _s.trail_after_tp, _s.trail_atr_mult
         ptp_on, ptp_frac, ptp_r = _s.partial_tp_enabled, _s.partial_tp_fraction, _s.partial_tp_r
+        lock_r, max_bars = _s.lock_profit_r, _s.max_bars_in_trade
     except Exception:
         ride = bool(args.ride_trend)
         rmode = args.risk_mode or "fixed"
@@ -856,7 +878,7 @@ def main(argv=None) -> int:
                      session_end_hour=sess_end,
                      trail_after_tp=trail, trail_atr_mult=trail_mult,
                      partial_tp_enabled=ptp_on, partial_tp_fraction=ptp_frac,
-                     partial_tp_r=ptp_r)
+                     partial_tp_r=ptp_r, lock_profit_r=lock_r, max_bars_in_trade=max_bars)
     print(f"(backtest config: ride_trend={ride}, risk_mode={rmode}, "
           f"htf_gate={htf_gate}, session={session} [{sess_start:02d}-{sess_end:02d} UTC])")
     out_dir = Path(__file__).resolve().parent.parent / "logs"

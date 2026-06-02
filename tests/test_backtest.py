@@ -111,6 +111,41 @@ def test_partial_tp_disabled_by_default():
     assert (res.trades["reason_close"] == "partial-TP").sum() == 0
 
 
+def test_lock_profit_keeps_gain_on_remainder():
+    # Same +1R spike, but lock_profit_r=0.8 should move the remainder's stop to
+    # entry + 0.8*0.0015 = 1.1012, so the remainder exits IN PROFIT, not at break-even.
+    df = _flat_frame(60)
+    df.iloc[32, df.columns.get_loc("high")] = 1.1015
+    res = _run_forced(df, trigger_i=30,
+                      costs=CostModel(spread_price=0.0, commission_per_lot=0.0),
+                      partial_tp_enabled=True, partial_tp_fraction=0.5, partial_tp_r=1.0,
+                      lock_profit_r=0.8)
+    rem = res.trades[res.trades["reason_close"] != "partial-TP"]
+    assert len(rem) == 1
+    assert rem.iloc[0]["exit"] == pytest.approx(1.1012, abs=1e-4)
+    assert rem.iloc[0]["pnl"] > 0   # locked +0.8R, not a break-even scratch
+
+
+def test_time_exit_closes_stale_pre_target_trade():
+    # A totally flat market never reaches target/partial; with max_bars_in_trade=5
+    # the trade is force-closed ~5 bars after entry, at roughly break-even.
+    df = _flat_frame(60)
+    res = _run_forced(df, trigger_i=30,
+                      costs=CostModel(spread_price=0.0, commission_per_lot=0.0),
+                      max_bars_in_trade=5)
+    assert (res.trades["reason_close"] == "time-exit").any()
+    t = res.trades[res.trades["reason_close"] == "time-exit"].iloc[0]
+    assert t["pnl"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_no_time_exit_when_disabled():
+    df = _flat_frame(60)
+    res = _run_forced(df, trigger_i=30,
+                      costs=CostModel(spread_price=0.0, commission_per_lot=0.0),
+                      max_bars_in_trade=0)
+    assert (res.trades["reason_close"] == "time-exit").sum() == 0
+
+
 def test_stop_loss_exit_is_negative_one_R():
     df = _flat_frame(60)
     df.iloc[32, df.columns.get_loc("low")] = 1.0900   # crash down → hit SL

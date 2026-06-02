@@ -56,6 +56,7 @@ def _bt_kwargs_from_settings(equity: float, risk: float, costs: CostModel) -> di
             trail_after_tp=s.trail_after_tp, trail_atr_mult=s.trail_atr_mult,
             partial_tp_enabled=s.partial_tp_enabled,
             partial_tp_fraction=s.partial_tp_fraction, partial_tp_r=s.partial_tp_r,
+            lock_profit_r=s.lock_profit_r, max_bars_in_trade=s.max_bars_in_trade,
         )
     except Exception as e:  # offline / no .env -> sensible defaults
         print(f"(could not load .env, using defaults: {e})")

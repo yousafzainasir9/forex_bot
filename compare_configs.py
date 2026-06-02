@@ -80,7 +80,7 @@ def _presets() -> List[Tuple[str, dict, dict]]:
              "ride_trend_after_tp": True, "risk_mode": "fixed",
              "trail_after_tp": True, "trail_atr_mult": 1.5,
              "partial_tp_enabled": True, "partial_tp_fraction": 0.5,
-             "partial_tp_r": 1.0},
+             "partial_tp_r": 1.0, "lock_profit_r": 0.8},
         ),
     ]
 
