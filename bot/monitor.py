@@ -62,6 +62,7 @@ class Stats:
     gross_profit: float = 0.0
     gross_loss: float = 0.0      # stored as a positive magnitude
     sum_r: float = 0.0
+    consecutive_losses: int = 0  # trailing run of losing trades (reset by any win)
     equity_curve: List[float] = field(default_factory=list)
 
     @property
@@ -143,12 +144,17 @@ class Monitor:
     def _fold_trade(self, pnl: float, r_multiple: float) -> None:
         self.stats.n_trades += 1
         self.stats.sum_r += r_multiple
-        if pnl >= 0:
+        # Only strictly-positive P&L counts as a win; a break-even trade (pnl==0)
+        # adds nothing to gross profit/loss and is recorded on the loss side of the
+        # count so the win rate isn't inflated.
+        if pnl > 0:
             self.stats.wins += 1
             self.stats.gross_profit += pnl
+            self.stats.consecutive_losses = 0
         else:
             self.stats.losses += 1
             self.stats.gross_loss += -pnl
+            self.stats.consecutive_losses += 1
         prev = self.stats.equity_curve[-1] if self.stats.equity_curve else 0.0
         self.stats.equity_curve.append(prev + pnl)
 

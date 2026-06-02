@@ -23,7 +23,7 @@ def _flat_frame(n=60, price=1.1000, hi=1.1001, lo=1.0999):
 
 def _buy_once_stub(trigger_i):
     """Return an evaluate() replacement that BUYs only at bar index trigger_i."""
-    def fake(win, *, rsi_overbought=70.0, rsi_oversold=30.0, open_side=None):
+    def fake(win, *, open_side=None, **_):
         row = win.iloc[-1]
         is_trigger = (len(win) and win.attrs.get("_i") == trigger_i)
         action = Action.BUY if (open_side is None and is_trigger) else Action.HOLD
@@ -55,7 +55,7 @@ def _run_forced(df, trigger_i, **kw):
     """Run the engine but force a BUY at one specific bar index."""
     import bot.backtest as mod
     orig = mod.evaluate
-    def fake(win, *, rsi_overbought=70.0, rsi_oversold=30.0, open_side=None):
+    def fake(win, *, open_side=None, **_):
         row = win.iloc[-1]
         cur_i = df.index.get_loc(win.index[-1])
         action = Action.BUY if (open_side is None and cur_i == trigger_i) else Action.HOLD
@@ -80,6 +80,35 @@ def test_take_profit_exit_and_next_open_entry():
     assert t["entry"] == pytest.approx(1.1000, abs=1e-9)   # next-bar (31) open, no spread
     assert t["pnl"] > 0
     assert t["r_multiple"] == pytest.approx(1.5, abs=0.05)  # TP sits at 1.5R
+
+
+def test_partial_take_profit_banks_and_moves_to_be():
+    # Long entered at bar 31 open (1.1000), stop distance 1.5*ATR(0.0010)=0.0015.
+    # Bar 32 reaches +1R (1.1015) but not the +1.5R TP (1.10225): a partial should
+    # bank half and move the remainder to break-even, so the remainder exits ~flat.
+    df = _flat_frame(60)
+    df.iloc[32, df.columns.get_loc("high")] = 1.1015
+    res = _run_forced(df, trigger_i=30,
+                      costs=CostModel(spread_price=0.0, commission_per_lot=0.0),
+                      partial_tp_enabled=True, partial_tp_fraction=0.5, partial_tp_r=1.0)
+    reasons = list(res.trades["reason_close"])
+    assert "partial-TP" in reasons
+    part = res.trades[res.trades["reason_close"] == "partial-TP"].iloc[0]
+    assert part["pnl"] > 0
+    assert part["exit"] == pytest.approx(1.1015, abs=1e-6)
+    # The remainder is now stopped at break-even (entry), so it exits ~flat.
+    rem = res.trades[res.trades["reason_close"] != "partial-TP"]
+    assert len(rem) == 1
+    assert rem.iloc[0]["pnl"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_partial_tp_disabled_by_default():
+    # Same spike, but with partial disabled the trade just rides to the full TP.
+    df = _flat_frame(60)
+    df.iloc[32, df.columns.get_loc("high")] = 1.1100
+    res = _run_forced(df, trigger_i=30,
+                      costs=CostModel(spread_price=0.0, commission_per_lot=0.0))
+    assert (res.trades["reason_close"] == "partial-TP").sum() == 0
 
 
 def test_stop_loss_exit_is_negative_one_R():

@@ -102,6 +102,32 @@ def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return _wilder_rma(tr, period)
 
 
+def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Average Directional Index (Wilder) — a 0-100 trend-STRENGTH gauge.
+
+    ADX measures how strongly price is trending, regardless of direction. A common
+    reading: ADX rising above ~20-25 = a real trend worth following; low or falling
+    ADX = chop where a crossover system whipsaws. Uses the same Wilder smoothing as
+    RSI/ATR and is fully causal (only diff/shift(1) — no look-ahead).
+    """
+    if period <= 0:
+        raise ValueError("ADX period must be positive.")
+    high = df["high"]
+    low = df["low"]
+    up_move = high.diff()
+    down_move = -low.diff()
+    # Directional movement: only the larger, positive side counts each bar.
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0.0), 0.0)
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0.0), 0.0)
+
+    atr_ = _wilder_rma(true_range(df), period).replace(0.0, np.nan)
+    plus_di = 100.0 * _wilder_rma(plus_dm, period) / atr_
+    minus_di = 100.0 * _wilder_rma(minus_dm, period) / atr_
+    di_sum = (plus_di + minus_di).replace(0.0, np.nan)
+    dx = 100.0 * (plus_di - minus_di).abs() / di_sum
+    return _wilder_rma(dx.fillna(0.0), period)
+
+
 def add_indicators(
     df: pd.DataFrame,
     *,
@@ -109,12 +135,13 @@ def add_indicators(
     ema_slow: int = 21,
     rsi_period: int = 14,
     atr_period: int = 14,
+    adx_period: int = 14,
 ) -> pd.DataFrame:
     """Return a copy of ``df`` with indicator columns appended.
 
     Expects columns: open, high, low, close (volume optional). Index should be a
     UTC DatetimeIndex of *closed* candles. Adds:
-      ema_fast, ema_slow, rsi, atr.
+      ema_fast, ema_slow, rsi, atr, adx.
     """
     required = {"open", "high", "low", "close"}
     missing = required - set(df.columns)
@@ -126,4 +153,5 @@ def add_indicators(
     out["ema_slow"] = ema(out["close"], ema_slow)
     out["rsi"] = rsi(out["close"], rsi_period)
     out["atr"] = atr(out, atr_period)
+    out["adx"] = adx(out, adx_period)
     return out

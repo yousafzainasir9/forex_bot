@@ -4,12 +4,44 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from bot.indicators import add_indicators, atr, ema, rsi, true_range
+from bot.indicators import add_indicators, adx, atr, ema, rsi, true_range
 
 
 def _series(values):
     idx = pd.date_range("2024-01-01", periods=len(values), freq="15min", tz="UTC")
     return pd.Series(values, index=idx, dtype="float64")
+
+
+def test_adx_in_range_and_flags_strong_trend():
+    # A clean linear ramp is a textbook strong trend: ADX should climb well above 25
+    # and every value must stay within [0, 100].
+    idx = pd.date_range("2024-01-01", periods=120, freq="5min", tz="UTC")
+    close = pd.Series(np.linspace(1.10, 1.20, 120), index=idx)
+    df = pd.DataFrame({"open": close, "high": close + 0.0005,
+                       "low": close - 0.0005, "close": close}, index=idx)
+    a = adx(df, 14)
+    assert (a.dropna() >= 0).all() and (a.dropna() <= 100).all()
+    assert a.iloc[-1] > 25
+
+
+def test_adx_low_in_chop():
+    # A flat/oscillating series has no trend -> ADX should be modest, not screaming.
+    idx = pd.date_range("2024-01-01", periods=200, freq="5min", tz="UTC")
+    osc = 1.10 + 0.0005 * np.sin(np.arange(200) / 2.0)
+    close = pd.Series(osc, index=idx)
+    df = pd.DataFrame({"open": close, "high": close + 0.0006,
+                       "low": close - 0.0006, "close": close}, index=idx)
+    a = adx(df, 14)
+    assert a.iloc[-1] < 40  # choppy -> not a strong trend reading
+
+
+def test_add_indicators_includes_adx():
+    idx = pd.date_range("2024-01-01", periods=60, freq="5min", tz="UTC")
+    close = pd.Series(np.linspace(1.1, 1.15, 60), index=idx)
+    df = pd.DataFrame({"open": close, "high": close + 0.0005,
+                       "low": close - 0.0005, "close": close}, index=idx)
+    out = add_indicators(df)
+    assert "adx" in out.columns
 
 
 def test_ema_recursive_matches_manual():

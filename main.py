@@ -38,14 +38,14 @@ from typing import Optional
 
 import pandas as pd
 
-from bot.config import Settings
+from bot.config import Settings, in_trading_session
 from bot.control import kill_active
 from bot.data import DataFeed
 from bot.execution import Executor
 from bot.indicators import add_indicators
 from bot.monitor import Monitor
-from bot.risk import DailyState, RiskManager
-from bot.scanner import scan_watchlist, rank_opportunities
+from bot.risk import DailyState, RiskManager, breaker_reason
+from bot.scanner import scan_watchlist, rank_opportunities, exposure_breach
 from bot.strategy import Action, PositionSide, evaluate, trend_ride_exit
 
 
@@ -62,16 +62,24 @@ class Bot:
         self.mon = Monitor(settings.log_dir)
         self.feed = DataFeed(settings)
         self.execu = Executor(settings, monitor=self.mon)
+        # Reconcile the two concurrency caps so they can't silently contradict each
+        # other: in top_n mode the runner opens up to scan_top_n positions, so the
+        # risk manager must allow at least that many (otherwise it vetoes every
+        # entry past MAX_OPEN_POSITIONS, defaulting to 1).
+        eff_max_open = settings.max_open_positions
+        if settings.scan_mode == "top_n":
+            eff_max_open = max(eff_max_open, settings.scan_top_n)
         self.risk = RiskManager(
             risk_per_trade=settings.risk_per_trade,
             max_risk_per_trade=settings.max_risk_per_trade,
             max_daily_loss=settings.max_daily_loss,
             risk_mode=settings.risk_mode,
-            max_open_positions=settings.max_open_positions,
+            max_open_positions=eff_max_open,
             atr_multiplier=settings.atr_multiplier,
             risk_reward=settings.risk_reward,
         )
         self.daily: Optional[DailyState] = None
+        self._peak_equity = 0.0   # highest equity seen this run (for drawdown breaker)
         self.active_symbol = settings.symbol
         self._last_signal = None
         self._last_scan = []
@@ -102,9 +110,24 @@ class Bot:
             if self.active_symbol not in available:
                 self.active_symbol = available[0]
         self.mon.info(f"Watchlist active ({len(self.s.symbols)}): {', '.join(self.s.symbols)}")
-        self.daily = DailyState(start_equity=acct.equity)
         self.mon.maybe_rollover(equity=acct.equity)
         self._startup_backfill()
+        # L1: seed today's realized P&L so the daily-loss halt reflects losses that
+        # already occurred today (e.g. the bot restarted mid-session). Without this,
+        # the halt baseline resets to zero on every restart and could keep trading
+        # past the daily limit.
+        realized_today = 0.0
+        try:
+            from bot.report import build_report
+            summary, _ = build_report(self.mon.trades_csv, "today")
+            realized_today = summary.net_pnl
+        except Exception as e:
+            self.mon.warning(f"Could not seed today's realized P&L: {e}")
+        self.daily = DailyState(start_equity=acct.equity, realized_pnl_today=realized_today)
+        if realized_today < 0:
+            self.mon.info(
+                f"Seeded daily state with today's realized P&L {realized_today:+.2f} "
+                f"(loss fraction {self.daily.loss_fraction():.2%} of equity).")
         self._write_status(acct)
 
     def _startup_backfill(self) -> None:
@@ -169,6 +192,12 @@ class Bot:
     def _kill(self) -> bool:
         return bool(self.s.kill_switch) or kill_active(self.s.log_dir)
 
+    def _in_session(self) -> bool:
+        """True if the current UTC hour is inside the configured trading window."""
+        return in_trading_session(
+            datetime.now(timezone.utc).hour,
+            self.s.session_start_hour, self.s.session_end_hour)
+
     def _spec_for(self, symbol: str):
         if symbol not in self._spec_cache:
             try:
@@ -212,7 +241,11 @@ class Bot:
                 },
                 "daily_realized_pnl": round(self.daily.realized_pnl_today, 2) if self.daily else 0.0,
                 "daily_loss_fraction": round(self.daily.loss_fraction(), 4) if self.daily else 0.0,
-                "max_daily_loss": self.s.max_daily_loss,
+                # Report the EFFECTIVE daily-loss limit actually enforced (tier value
+                # in tiered mode), not the unused fixed field — otherwise the
+                # dashboard understates the real halt threshold.
+                "max_daily_loss": round(
+                    self.risk.effective_risk(getattr(acct, "equity", 0.0) or 0.0)["max_daily_loss"], 4),
                 "risk": (lambda e: (lambda r: {
                     "mode": self.s.risk_mode,
                     "per_trade": round(r["risk_per_trade"], 4),
@@ -258,7 +291,8 @@ class Bot:
             enriched = add_indicators(candles, ema_fast=self.s.ema_fast,
                                       ema_slow=self.s.ema_slow,
                                       rsi_period=self.s.rsi_period,
-                                      atr_period=self.s.atr_period)
+                                      atr_period=self.s.atr_period,
+                                      adx_period=self.s.adx_period)
             df = enriched.tail(n)
             out, ef, es = [], [], []
             for ts, row in df.iterrows():
@@ -287,8 +321,11 @@ class Bot:
             add_indicators(
                 self.feed.get_candles(symbol=sym, timeframe=self.s.timeframe, n=self.s.history_bars),
                 ema_fast=self.s.ema_fast, ema_slow=self.s.ema_slow,
-                rsi_period=self.s.rsi_period, atr_period=self.s.atr_period),
+                rsi_period=self.s.rsi_period, atr_period=self.s.atr_period,
+                adx_period=self.s.adx_period),
             rsi_overbought=self.s.rsi_overbought, rsi_oversold=self.s.rsi_oversold,
+            rsi_mode=self.s.rsi_mode, rsi_midline=self.s.rsi_midline,
+            adx_min=(self.s.adx_min if self.s.require_adx else 0.0),
             open_side=None,
         )
         if sig.action not in (Action.BUY, Action.SELL):
@@ -312,6 +349,7 @@ class Bot:
             self.mon.note_open(pid, {
                 "symbol": sym, "side": plan.side.value,
                 "stop_loss": plan.stop_loss, "take_profit": plan.take_profit,
+                "stop_distance": plan.stop_distance, "entry": plan.entry_price,
                 "risk_amount": plan.risk_amount, "reason_open": plan.reason,
             })
             return True
@@ -365,14 +403,41 @@ class Bot:
                 self.mon.info(f"Exit signal on {p.symbol}: {sc.reason}")
                 self.execu.close_position(p.ticket)
                 continue
+            if self.s.partial_tp_enabled:
+                self._partial_tp_check(p)
             if self.s.ride_trend_after_tp:
                 self._trend_ride_check(p)
 
         # --- 2) Open new positions per scan_mode. ---
+        # Session filter: only OPEN new positions inside the configured UTC window.
+        # Existing positions are still managed/closed above, regardless of session.
+        if self.s.session_filter and not self._in_session():
+            self.mon.info(
+                f"Outside trading session "
+                f"({self.s.session_start_hour:02d}:00-{self.s.session_end_hour:02d}:00 UTC) "
+                f"— managing open trades only, no new entries.")
+            return
         if kill or not ranked:
             return
         acct = self.feed.account_info()
         equity = acct.equity
+
+        # Account-level circuit-breakers (on top of the daily-loss halt): a losing
+        # streak or a deep peak->equity drawdown stops NEW entries. Open trades are
+        # still managed/closed above. The drawdown baseline (peak) resets on restart.
+        self._peak_equity = max(self._peak_equity, equity)
+        dd = ((self._peak_equity - equity) / self._peak_equity
+              if self._peak_equity > 0 else 0.0)
+        brk = breaker_reason(
+            consecutive_losses=self.mon.stats.consecutive_losses,
+            max_consecutive_losses=self.s.max_consecutive_losses,
+            drawdown_fraction=dd,
+            max_total_drawdown=self.s.max_total_drawdown,
+        )
+        if brk:
+            self.mon.warning(f"Circuit-breaker: {brk}.")
+            return
+
         open_now = self.execu.open_positions_all()
         open_syms = {p.symbol for p in open_now}
 
@@ -392,6 +457,12 @@ class Bot:
                 if cand.symbol in open_syms:
                     continue
                 if cand.score < self.s.scan_min_score:
+                    continue
+                # Correlation guard: don't stack positions on the same currency.
+                if exposure_breach(open_syms, cand.symbol, self.s.max_per_currency):
+                    self.mon.info(
+                        f"Skip {cand.symbol}: per-currency exposure cap "
+                        f"({self.s.max_per_currency}) would be exceeded.")
                     continue
                 if self._try_open(cand, equity, open_count=len(open_syms), kill=kill):
                     open_syms.add(cand.symbol)
@@ -413,17 +484,67 @@ class Bot:
                 return kk, v, m
         return None, {}, m
 
+    def _partial_tp_check(self, p) -> None:
+        """Bank part of the position once price reaches the partial target
+        (``partial_tp_r`` in R = multiples of the original stop distance), then move
+        the remaining lots' stop to break-even. One-shot per position, latched via
+        'partial_done' in the bookkeeping file. Best-effort; never breaks the loop."""
+        key, info, _ = self._open_entry(p)
+        if info.get("partial_done"):
+            return
+        sd = float(info.get("stop_distance", 0) or 0)
+        if sd <= 0:
+            return  # no stored stop distance (e.g. externally opened) — skip
+        target = (p.entry + sd * self.s.partial_tp_r if p.side is PositionSide.LONG
+                  else p.entry - sd * self.s.partial_tp_r)
+        try:
+            candles = self.feed.get_candles(symbol=p.symbol, timeframe=self.s.timeframe, n=3)
+        except Exception as e:
+            self.mon.warning(f"partial-TP: candle fetch failed for {p.symbol}: {e}")
+            return
+        if candles is None or len(candles) < 1:
+            return
+        last = candles.iloc[-1]
+        hit = ((p.side is PositionSide.LONG and float(last["high"]) >= target)
+               or (p.side is PositionSide.SHORT and float(last["low"]) <= target))
+        if not hit:
+            return
+        close_vol = round(p.lots * self.s.partial_tp_fraction, 2)
+        # Both the banked slice and the remainder must be tradeable (>= broker min).
+        if close_vol < 0.01 or (p.lots - close_vol) < 0.01:
+            return
+        res = self.execu.close_position(p.ticket, volume=close_vol)
+        if not res.ok:
+            self.mon.warning(f"{p.symbol}: partial-TP close rejected: {res.detail}")
+            return
+        if key is not None:
+            info["partial_done"] = True
+            m = self.mon._read_open_map()
+            m[key] = {**m.get(key, {}), **info}
+            self.mon._write_open_map(m)
+        self.mon.info(
+            f"{p.symbol}: partial take-profit — banked {close_vol} lots @ "
+            f"{round(target, 5)} ({self.s.partial_tp_r:g}R); moving remainder to break-even.")
+        try:
+            self.execu.modify_sl_tp(p.ticket, stop_loss=p.entry, take_profit=0.0)
+        except Exception as e:
+            self.mon.warning(f"{p.symbol}: break-even move after partial failed: {e}")
+
     def _trend_ride_check(self, p) -> None:
         """Once a position reaches its target, ride the trend: hold while each new
-        closed bar keeps printing higher (LONG) / lower (SHORT) closes, and exit
-        only when a bar closes against the trade. The broker stop-loss still caps
-        the downside throughout."""
+        closed bar keeps making a higher HIGH (LONG) / lower LOW (SHORT), and exit
+        on the first bar whose high comes in below the prior high (LONG) / whose low
+        comes in above the prior low (SHORT) — i.e. the turn is detected on candle
+        EXTREMES, not closes (see strategy.trend_ride_exit). When the target is
+        first reached the stop is moved to break-even; the broker stop-loss caps the
+        downside throughout."""
         key, info, _ = self._open_entry(p)
         tp = float(info.get("take_profit", 0) or 0)
         if tp <= 0:
             return  # no stored target — nothing to ride (e.g. externally opened)
         try:
-            candles = self.feed.get_candles(symbol=p.symbol, timeframe=self.s.timeframe, n=10)
+            candles = self.feed.get_candles(symbol=p.symbol, timeframe=self.s.timeframe,
+                                            n=max(self.s.atr_period + 5, 12))
         except Exception as e:
             self.mon.warning(f"trend-ride: candle fetch failed for {p.symbol}: {e}")
             return
@@ -444,6 +565,48 @@ class Bot:
             self.mon._write_open_map(m)
             self.mon.info(f"{p.symbol}: target {tp} reached — trend-riding "
                           f"(won't close until a turning {self.s.timeframe} bar).")
+            # H3: lock in break-even. Once the target is reached the broker stop is
+            # moved to entry, so a reversal while riding can no longer turn a winner
+            # into a full-size loss. (Without this, removing the TP to ride leaves
+            # only the original ATR stop — profit could fully round-trip.)
+            try:
+                res = self.execu.modify_sl_tp(p.ticket, stop_loss=p.entry, take_profit=0.0)
+                if res.ok:
+                    self.mon.info(f"{p.symbol}: stop moved to break-even @ {p.entry} (riding).")
+                else:
+                    self.mon.warning(f"{p.symbol}: break-even stop move rejected: {res.detail}")
+            except Exception as e:
+                self.mon.warning(f"{p.symbol}: break-even stop move failed: {e}")
+
+        # Ongoing ATR trailing while riding: ratchet the broker stop in our favour so
+        # a deep reversal gives back less than a full round-trip. Only moves the stop
+        # the protective direction, never looser. Best-effort; never breaks the loop.
+        if (self.s.trail_after_tp and not dec.should_close
+                and (dec.tp_reached or info.get("tp_reached"))):
+            try:
+                from bot.indicators import atr as _atr
+                a = _atr(candles, self.s.atr_period)
+                cur_atr = float(a.iloc[-1]) if not pd.isna(a.iloc[-1]) else 0.0
+                cur_sl = float(p.stop_loss or 0.0)
+                last_close = float(last["close"])
+                new_sl = None
+                if cur_atr > 0 and p.side is PositionSide.LONG:
+                    cand = last_close - self.s.trail_atr_mult * cur_atr
+                    if cand < last_close and (cur_sl <= 0 or cand > cur_sl):
+                        new_sl = cand
+                elif cur_atr > 0:  # SHORT
+                    cand = last_close + self.s.trail_atr_mult * cur_atr
+                    if cand > last_close and (cur_sl <= 0 or cand < cur_sl):
+                        new_sl = cand
+                if new_sl is not None:
+                    res = self.execu.modify_sl_tp(p.ticket, stop_loss=round(new_sl, 5),
+                                                  take_profit=0.0)
+                    if res.ok:
+                        self.mon.info(f"{p.symbol}: trailing stop -> {round(new_sl, 5)} "
+                                      f"(ATR {cur_atr:.5f} x {self.s.trail_atr_mult}).")
+            except Exception as e:
+                self.mon.warning(f"{p.symbol}: trailing stop update skipped: {e}")
+
         if dec.should_close:
             self.mon.info(f"{p.symbol}: {dec.reason} — closing.")
             self.execu.close_position(p.ticket)
@@ -454,9 +617,12 @@ class Bot:
             enr = add_indicators(
                 self.feed.get_candles(symbol=symbol, timeframe=self.s.timeframe, n=self.s.history_bars),
                 ema_fast=self.s.ema_fast, ema_slow=self.s.ema_slow,
-                rsi_period=self.s.rsi_period, atr_period=self.s.atr_period)
+                rsi_period=self.s.rsi_period, atr_period=self.s.atr_period,
+                adx_period=self.s.adx_period)
             return evaluate(enr, rsi_overbought=self.s.rsi_overbought,
-                            rsi_oversold=self.s.rsi_oversold)
+                            rsi_oversold=self.s.rsi_oversold,
+                            rsi_mode=self.s.rsi_mode, rsi_midline=self.s.rsi_midline,
+                            adx_min=(self.s.adx_min if self.s.require_adx else 0.0))
         except Exception:
             return self._last_signal
 

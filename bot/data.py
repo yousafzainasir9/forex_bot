@@ -164,7 +164,18 @@ class DataFeed:
             t = mt5.symbol_info_tick(self.s.symbol)
             if t is not None and getattr(t, "time", 0):
                 real = datetime.now(timezone.utc).timestamp()
-                off = int(round((t.time - real) / 900.0) * 900)
+                raw = t.time - real
+                # Real broker offsets are whole/half hours, so round to 30 min.
+                candidate = int(round(raw / 1800.0) * 1800)
+                # Sanity gate: a fresh tick should be within the plausible server
+                # offset band (~UTC-12..+14). A value outside that almost always
+                # means the tick is STALE (market closed) — don't trust it; using a
+                # bogus offset would mis-stamp every candle's UTC time. Fall back to
+                # 0 and let BROKER_UTC_OFFSET_HOURS be set explicitly if needed.
+                if -12 * 3600 <= candidate <= 14 * 3600:
+                    off = candidate
+                else:
+                    off = 0
         except Exception:
             off = 0
         self._server_offset_sec = off

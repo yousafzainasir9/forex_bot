@@ -53,6 +53,30 @@ DEFAULT_RISK_TIERS = [
 ]
 
 
+def breaker_reason(
+    *,
+    consecutive_losses: int,
+    max_consecutive_losses: int,
+    drawdown_fraction: float,
+    max_total_drawdown: float,
+) -> Optional[str]:
+    """Return a halt reason if a global circuit-breaker has tripped, else None.
+
+    Pure and testable. Each check is disabled when its limit is <= 0. These are
+    account-level protections that sit ON TOP of the per-day loss halt:
+      * a losing streak (``consecutive_losses``) — forces a review after a bad run;
+      * a peak-to-current equity drawdown (``drawdown_fraction``) — a hard stop on
+        new entries while the account is deep underwater.
+    """
+    if max_consecutive_losses > 0 and consecutive_losses >= max_consecutive_losses:
+        return (f"{consecutive_losses} consecutive losses >= limit "
+                f"{max_consecutive_losses} — new entries halted")
+    if max_total_drawdown > 0 and drawdown_fraction >= max_total_drawdown:
+        return (f"account drawdown {drawdown_fraction:.1%} >= limit "
+                f"{max_total_drawdown:.1%} — new entries halted")
+    return None
+
+
 def tier_for_equity(equity: float, tiers=None) -> dict:
     """Return the risk tier whose min_equity is the highest one <= equity."""
     tiers = tiers or DEFAULT_RISK_TIERS

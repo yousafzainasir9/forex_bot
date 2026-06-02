@@ -4,8 +4,10 @@ Turns an indicator-enriched candle DataFrame into a single, explicit trading
 ``Signal`` for the most recently *closed* bar, with a human-readable reason.
 
 Rule set (spec §4) — a transparent learning baseline, NOT a money-maker:
-  * LONG  when fast EMA crosses ABOVE slow EMA AND RSI < overbought (default 70).
-  * SHORT when fast EMA crosses BELOW slow EMA AND RSI > oversold  (default 30).
+  * LONG  when fast EMA crosses ABOVE slow EMA AND RSI confirms momentum
+          (confirm mode: RSI >= midline; legacy filter mode: RSI < overbought).
+  * SHORT when fast EMA crosses BELOW slow EMA AND RSI confirms momentum
+          (confirm mode: RSI <= midline; legacy filter mode: RSI > oversold).
   * EXIT  an open trade early on the opposite EMA cross.
   * Otherwise HOLD. Sitting out is a valid action.
 
@@ -66,6 +68,9 @@ def evaluate(
     *,
     rsi_overbought: float = 70.0,
     rsi_oversold: float = 30.0,
+    rsi_mode: str = "filter",
+    rsi_midline: float = 50.0,
+    adx_min: float = 0.0,
     open_side: Optional[PositionSide] = None,
 ) -> Signal:
     """Evaluate the strategy on the last closed bar of ``df``.
@@ -74,7 +79,16 @@ def evaluate(
     ----------
     df : indicator-enriched DataFrame (must contain ema_fast, ema_slow, rsi, atr).
          The LAST row is treated as the most recently *closed* bar.
-    rsi_overbought / rsi_oversold : RSI filter thresholds.
+    rsi_overbought / rsi_oversold : RSI thresholds used in legacy "filter" mode.
+    rsi_mode : how RSI gates an entry.
+        * "confirm" (recommended for this trend-following cross): RSI must AGREE
+          with the cross — a BUY needs RSI >= ``rsi_midline``, a SELL needs
+          RSI <= ``rsi_midline``. This requires momentum to back the signal.
+        * "filter" (legacy): only veto when already overbought/oversold — which,
+          at a fresh cross, almost never triggers (near no-op).
+    rsi_midline : the confirm-mode threshold (default 50).
+    adx_min : minimum ADX (trend strength) required to OPEN a trade; <= 0 disables
+         the gate. Requires an "adx" column when > 0. Exits are never gated.
     open_side : the side of a currently-open position (or None). Used to decide
          whether an opposite cross should produce a CLOSE.
 
@@ -120,8 +134,24 @@ def evaluate(
         return _signal(Action.HOLD, cur, bar_time,
                        f"holding open {open_side.value}; no opposite cross")
 
+    # --- Trend-strength gate (skip chop). Applies only to fresh entries; an open
+    #     position's exits were already handled above. adx_min<=0 disables it. ---
+    if adx_min > 0 and (bull or bear):
+        adx_val = (float(cur["adx"])
+                   if "adx" in cur.index and not pd.isna(cur["adx"]) else float("nan"))
+        if pd.isna(adx_val) or adx_val < adx_min:
+            return _signal(Action.HOLD, cur, bar_time,
+                           f"cross but ADX {adx_val:.1f} < {adx_min:.0f} (no trend strength)")
+
     # --- Entry logic (flat). ---
     if bull:
+        if rsi_mode == "confirm":
+            if r >= rsi_midline:
+                return _signal(Action.BUY, cur, bar_time,
+                               f"bullish EMA cross & RSI {r:.1f} >= {rsi_midline:.0f} (momentum confirms)")
+            return _signal(Action.HOLD, cur, bar_time,
+                           f"bullish cross but RSI {r:.1f} < {rsi_midline:.0f} (no momentum confirmation)")
+        # legacy filter mode
         if r < rsi_overbought:
             return _signal(Action.BUY, cur, bar_time,
                            f"bullish EMA cross & RSI {r:.1f} < {rsi_overbought:.0f}")
@@ -129,6 +159,13 @@ def evaluate(
                        f"bullish cross but RSI {r:.1f} >= {rsi_overbought:.0f} (overbought)")
 
     if bear:
+        if rsi_mode == "confirm":
+            if r <= rsi_midline:
+                return _signal(Action.SELL, cur, bar_time,
+                               f"bearish EMA cross & RSI {r:.1f} <= {rsi_midline:.0f} (momentum confirms)")
+            return _signal(Action.HOLD, cur, bar_time,
+                           f"bearish cross but RSI {r:.1f} > {rsi_midline:.0f} (no momentum confirmation)")
+        # legacy filter mode
         if r > rsi_oversold:
             return _signal(Action.SELL, cur, bar_time,
                            f"bearish EMA cross & RSI {r:.1f} > {rsi_oversold:.0f}")

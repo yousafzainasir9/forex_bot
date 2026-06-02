@@ -59,6 +59,36 @@ def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, x))
 
 
+def currencies_of(symbol: str) -> set:
+    """Decompose a symbol into the currencies/components it carries.
+
+    A 6-letter FX pair splits 3/3 (EURUSD -> {EUR, USD}; XAUUSD -> {XAU, USD};
+    BTCUSD -> {BTC, USD}). Anything else (indices like US30, NAS100, USOIL) is
+    treated atomically as a single component. Common broker suffixes (".raw", "m")
+    are stripped first. Used by the correlation/exposure cap.
+    """
+    core = (symbol or "").upper().strip().split(".")[0]
+    if len(core) == 6 and core.isalpha():
+        return {core[:3], core[3:]}
+    return {core or (symbol or "").upper().strip()}
+
+
+def exposure_breach(open_symbols, candidate: str, max_per_currency: int) -> bool:
+    """True if opening ``candidate`` would exceed ``max_per_currency`` open positions
+    on any single currency it shares with the already-open ones.
+
+    This stops the scanner from quietly stacking correlated bets — e.g. EURUSD +
+    EURGBP + EURJPY is really three bets on EUR. <= 0 disables the cap.
+    """
+    if max_per_currency <= 0:
+        return False
+    counts: Dict[str, int] = {}
+    for sym in open_symbols:
+        for c in currencies_of(sym):
+            counts[c] = counts.get(c, 0) + 1
+    return any(counts.get(c, 0) >= max_per_currency for c in currencies_of(candidate))
+
+
 @dataclass(frozen=True)
 class ScanScore:
     """Pure scoring breakdown for one symbol's opportunity."""
@@ -83,12 +113,18 @@ def score_opportunity(
     atr_multiplier: float,
     htf_trend: Optional[str],   # "UP" / "DOWN" / None (unknown)
     weights: Optional[Dict[str, float]] = None,
+    require_htf_align: bool = False,
 ) -> ScanScore:
     """Score a single opportunity from plain numbers. Pure & deterministic.
 
     Returns a ``ScanScore`` with each [0,1] component and the weighted total.
     ``tradable`` is False (with a reason) for non-actionable signals, degenerate
     inputs, or a spread that eats more than ``SPREAD_SKIP_FRAC`` of the stop.
+
+    When ``require_htf_align`` is True the higher-timeframe trend becomes a HARD
+    gate: an opportunity is not tradable unless the HTF trend is known AND agrees
+    with the trade direction (long needs HTF UP, short needs HTF DOWN). This is the
+    single most effective whipsaw filter for an intraday EMA cross.
     """
     w = weights or DEFAULT_WEIGHTS
 
@@ -125,11 +161,21 @@ def score_opportunity(
     vol_c = _clamp(atr_pct / VOL_TARGET_ATR_PCT)
 
     # --- higher-timeframe trend alignment ---
+    want = "UP" if action is Action.BUY else "DOWN"
     if htf_trend is None:
         trend_c = 0.5  # unknown -> neutral, neither rewarded nor punished
     else:
-        want = "UP" if action is Action.BUY else "DOWN"
         trend_c = 1.0 if htf_trend == want else 0.0
+
+    # HARD gate: when enabled, refuse entries that don't agree with the HTF trend
+    # (or whose HTF trend can't be determined). Risk rules beat raw signals.
+    if require_htf_align:
+        if htf_trend is None:
+            return ScanScore(0.0, 0.0, 0.0, 0.0, 0.0, False,
+                             "HTF trend unknown — gated (REQUIRE_HTF_ALIGN)")
+        if htf_trend != want:
+            return ScanScore(0.0, 0.0, 0.0, 0.0, 0.0, False,
+                             f"HTF trend {htf_trend} != {want} — gated (REQUIRE_HTF_ALIGN)")
 
     total = (w["signal"] * signal_c + w["volatility"] * vol_c
              + w["trend"] * trend_c + w["spread"] * spread_c)
@@ -225,9 +271,13 @@ def scan_symbol(feed, settings, symbol: str, *, open_side=None,
         enriched = add_indicators(candles, ema_fast=settings.ema_fast,
                                   ema_slow=settings.ema_slow,
                                   rsi_period=settings.rsi_period,
-                                  atr_period=settings.atr_period)
+                                  atr_period=settings.atr_period,
+                                  adx_period=getattr(settings, "adx_period", 14))
         sig = evaluate(enriched, rsi_overbought=settings.rsi_overbought,
-                       rsi_oversold=settings.rsi_oversold, open_side=open_side)
+                       rsi_oversold=settings.rsi_oversold,
+                       rsi_mode=settings.rsi_mode, rsi_midline=settings.rsi_midline,
+                       adx_min=(settings.adx_min if getattr(settings, "require_adx", False) else 0.0),
+                       open_side=open_side)
 
         res.action = sig.action.value
         res.reason = sig.reason
@@ -256,6 +306,7 @@ def scan_symbol(feed, settings, symbol: str, *, open_side=None,
             atr=sig.atr, price=sig.price, rsi=sig.rsi, spread=spread,
             atr_multiplier=settings.atr_multiplier, htf_trend=res.htf_trend,
             weights=weights,
+            require_htf_align=getattr(settings, "require_htf_align", False),
         )
         res.score = sc.total
         res.tradable = sc.tradable

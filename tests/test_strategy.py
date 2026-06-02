@@ -75,6 +75,54 @@ def test_open_position_no_opposite_cross_holds():
     assert sig.action is Action.HOLD
 
 
+def test_confirm_mode_bull_cross_needs_momentum():
+    # confirm mode: a bullish cross only BUYs when RSI >= midline (default 50).
+    df = _frame([(0.9, 1.0, 55), (1.1, 1.0, 55)])
+    assert evaluate(df, rsi_mode="confirm").action is Action.BUY
+    df_weak = _frame([(0.9, 1.0, 45), (1.1, 1.0, 45)])  # below midline -> no confirm
+    sig = evaluate(df_weak, rsi_mode="confirm")
+    assert sig.action is Action.HOLD
+    assert "no momentum confirmation" in sig.reason
+
+
+def test_confirm_mode_bear_cross_needs_momentum():
+    # confirm mode: a bearish cross only SELLs when RSI <= midline.
+    df = _frame([(1.1, 1.0, 45), (0.9, 1.0, 45)])
+    assert evaluate(df, rsi_mode="confirm").action is Action.SELL
+    df_weak = _frame([(1.1, 1.0, 55), (0.9, 1.0, 55)])  # above midline -> no confirm
+    sig = evaluate(df_weak, rsi_mode="confirm")
+    assert sig.action is Action.HOLD
+    assert "no momentum confirmation" in sig.reason
+
+
+def test_confirm_mode_respects_custom_midline():
+    # With midline 60, RSI 55 is NOT enough to confirm a long.
+    df = _frame([(0.9, 1.0, 55), (1.1, 1.0, 55)])
+    assert evaluate(df, rsi_mode="confirm", rsi_midline=60).action is Action.HOLD
+    assert evaluate(df, rsi_mode="confirm", rsi_midline=50).action is Action.BUY
+
+
+def test_adx_gate_blocks_weak_trend():
+    # Bullish cross with momentum confirmed, but ADX below the threshold -> HOLD.
+    df = _frame([(0.9, 1.0, 55), (1.1, 1.0, 55)])
+    df["adx"] = [10.0, 15.0]
+    sig = evaluate(df, rsi_mode="confirm", adx_min=20)
+    assert sig.action is Action.HOLD and "ADX" in sig.reason
+
+
+def test_adx_gate_allows_strong_trend():
+    df = _frame([(0.9, 1.0, 55), (1.1, 1.0, 55)])
+    df["adx"] = [22.0, 30.0]
+    assert evaluate(df, rsi_mode="confirm", adx_min=20).action is Action.BUY
+
+
+def test_adx_gate_disabled_when_zero():
+    # adx_min=0 (default) means the gate is off even if ADX is tiny.
+    df = _frame([(0.9, 1.0, 55), (1.1, 1.0, 55)])
+    df["adx"] = [1.0, 1.0]
+    assert evaluate(df, rsi_mode="confirm", adx_min=0).action is Action.BUY
+
+
 def test_warmup_nan_is_hold():
     idx = pd.date_range("2024-01-01", periods=2, freq="15min", tz="UTC")
     df = pd.DataFrame({

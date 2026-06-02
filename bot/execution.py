@@ -83,6 +83,16 @@ def build_closed_trades_from_deals(
         if not ins or not outs:
             continue  # still open or only partially visible in this window
 
+        # Partial-close safety: a position is only "closed" once the OUT volume has
+        # caught up with the IN volume. Without this, a partial take-profit (which
+        # writes an OUT deal while the remainder stays open) would be wrongly recorded
+        # as a full closed trade. When finally flat, the single recorded row sums ALL
+        # deals (partial + final) for the correct net P&L.
+        in_vol = sum(float(getattr(d, "volume", 0) or 0) for d in ins)
+        out_vol = sum(float(getattr(d, "volume", 0) or 0) for d in outs)
+        if out_vol + 1e-9 < in_vol:
+            continue  # only partially closed so far — wait until the position is flat
+
         # Ownership is decided by the OPENING deal's magic (the bot set it on the
         # entry order). magic=None records every closed position regardless.
         if magic is not None and getattr(ins[0], "magic", None) != magic:
@@ -231,6 +241,20 @@ class Executor:
             self._log_order(res)
             return res
 
+        # Spread guard: refuse to enter when the live spread is abnormally wide
+        # (news, illiquid hour) — that's where slippage quietly destroys an M5 edge.
+        max_sp = getattr(self.s, "max_spread_points", 0)
+        point = getattr(info, "point", 0) or 0
+        if max_sp and max_sp > 0 and point > 0:
+            spread_points = (tick.ask - tick.bid) / point
+            if spread_points > max_sp:
+                res = OrderResult(
+                    False,
+                    f"refused to open {symbol}: spread {spread_points:.0f}pts "
+                    f"> max {max_sp}pts")
+                self._log_order(res)
+                return res
+
         volume = _normalize_volume(plan.lots, info.volume_min, info.volume_max, info.volume_step)
         if plan.side is PositionSide.LONG:
             order_type = mt5.ORDER_TYPE_BUY
@@ -266,14 +290,23 @@ class Executor:
         elif result.retcode != mt5.TRADE_RETCODE_DONE:
             res = OrderResult(False, f"retcode={result.retcode} {result.comment}")
         else:
+            # Log realized entry slippage (intended plan price vs actual fill) so cost
+            # drift between backtest assumptions and live fills is measurable.
+            sign = 1.0 if plan.side is PositionSide.LONG else -1.0
+            slip = (result.price - plan.entry_price) * sign
+            slip_pts = (slip / point) if point > 0 else 0.0
             res = OrderResult(True,
                               f"opened {plan.side.value} {volume} {symbol} @ {result.price} "
-                              f"SL {plan.stop_loss} TP {plan.take_profit}",
+                              f"SL {plan.stop_loss} TP {plan.take_profit} "
+                              f"(slippage {slip_pts:+.1f}pts)",
                               ticket=result.order)
         self._log_order(res)
         return res
 
-    def close_position(self, ticket: int) -> OrderResult:
+    def close_position(self, ticket: int, volume: Optional[float] = None) -> OrderResult:
+        """Close a position at market. ``volume=None`` closes the whole position;
+        a smaller value does a PARTIAL close (banks part, leaves the rest open with
+        the same ticket). Volume is clamped to the position size and normalized."""
         refusal = self._guard()
         if refusal:
             # Kill switch blocks NEW orders, not closes — allow risk-reducing exits.
@@ -305,16 +338,28 @@ class Executor:
             close_type = mt5.ORDER_TYPE_BUY
             price = tick.ask
 
+        # Whole close by default; otherwise a normalized partial (never > position).
+        if volume is None:
+            close_vol = p.volume
+        else:
+            close_vol = _normalize_volume(min(volume, p.volume), info.volume_min,
+                                          info.volume_max, info.volume_step)
+        if close_vol <= 0:
+            res = OrderResult(False, f"close volume rounded to zero for {ticket}")
+            self._log_order(res)
+            return res
+        partial = close_vol < p.volume
+
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": p.symbol,
-            "volume": p.volume,
+            "volume": close_vol,
             "type": close_type,
             "position": ticket,
             "price": price,
             "deviation": self.s.deviation_points,
             "magic": self.s.magic_number,
-            "comment": "forex-bot v1 close",
+            "comment": "forex-bot v1 partial" if partial else "forex-bot v1 close",
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": self._pick_filling(info),
         }
@@ -325,7 +370,8 @@ class Executor:
         elif result.retcode != mt5.TRADE_RETCODE_DONE:
             res = OrderResult(False, f"close retcode={result.retcode} {result.comment}")
         else:
-            res = OrderResult(True, f"closed position {ticket} @ {result.price}", ticket=ticket)
+            tag = f"partial-closed {close_vol}" if partial else "closed"
+            res = OrderResult(True, f"{tag} position {ticket} @ {result.price}", ticket=ticket)
         self._log_order(res)
         return res
 

@@ -334,11 +334,26 @@ uv run pytest -q
 | `KILL_SWITCH` | `0` | Set to `1` to block all new orders instantly. |
 | `SYMBOL` | `EURUSD` | Pair to trade. IC Markets: `EURUSD`; OANDA: `EUR_USD`. |
 | `TIMEFRAME` | `M5` | Candle timeframe (`M1/M5/M15/M30/H1/H4/D1`). |
-| `RISK_PER_TRADE` | `0.01` | Risk 1% of equity per trade. |
-| `MAX_DAILY_LOSS` | `0.03` | Halt for the day after losing 3%. |
+| `RISK_PER_TRADE` | `0.01` | Risk 1% of equity per trade (used in `fixed` mode). |
+| `RISK_MODE` | `fixed` | `fixed` = 1% for all balances; `tiered` = scale risk up on small accounts (aggressive, validated against hard caps). |
+| `MAX_DAILY_LOSS` | `0.03` | Halt for the day after losing 3% (used in `fixed` mode). |
+| `REQUIRE_HTF_ALIGN` | `true` | Hard gate: only trade when the M5 signal agrees with the `HTF_TIMEFRAME` trend. |
+| `SESSION_FILTER` | `true` | Only open new trades inside the session-hour window (open trades still managed any time). |
+| `SESSION_START_HOUR` / `SESSION_END_HOUR` | `7` / `16` | UTC trading window (may wrap past midnight). |
 | `EMA_FAST` / `EMA_SLOW` | `9` / `21` | Fast & slow moving-average lengths (fast must be < slow). |
 | `RSI_PERIOD` | `14` | RSI lookback. |
-| `RSI_OVERBOUGHT` / `RSI_OVERSOLD` | `70` / `30` | RSI gates: don't buy above the first, don't sell below the second. |
+| `RSI_MODE` | `confirm` | `confirm` = RSI must agree with the cross (≥/≤ `RSI_MIDLINE`); `filter` = legacy overbought/oversold veto. |
+| `RSI_MIDLINE` | `50` | Confirm-mode threshold: long needs RSI ≥ this, short ≤ this. |
+| `RSI_OVERBOUGHT` / `RSI_OVERSOLD` | `70` / `30` | RSI gates used only when `RSI_MODE=filter`. |
+| `ADX_PERIOD` / `ADX_MIN` | `14` / `20` | ADX lookback and minimum trend strength to open a trade. |
+| `REQUIRE_ADX` | `true` | Hard gate: only enter when ADX ≥ `ADX_MIN` (skip chop). |
+| `MAX_TOTAL_DRAWDOWN` | `0.15` | Halt new entries if peak→equity drawdown exceeds this (0 = off; resets on restart). |
+| `MAX_CONSECUTIVE_LOSSES` | `6` | Halt new entries after this many losses in a row (0 = off). |
+| `MAX_PER_CURRENCY` | `1` | Cap concurrent positions sharing a currency (correlation guard; top_n/any only). |
+| `MAX_SPREAD_POINTS` | `0` | Execution refuses a fill if live spread exceeds this many points (0 = off). |
+| `TRAIL_AFTER_TP` / `TRAIL_ATR_MULT` | `true` / `1.5` | After target, trail the stop by ATR × mult (on top of break-even). |
+| `PARTIAL_TP_ENABLED` | `true` | Bank part of the position at the partial target, ride the rest. |
+| `PARTIAL_TP_FRACTION` / `PARTIAL_TP_R` | `0.5` / `1.0` | Fraction to bank, and the partial target distance in R (stop multiples). |
 | `ATR_PERIOD` | `14` | ATR lookback for stop sizing. |
 | `ATR_MULTIPLIER` | `1.5` | Stop distance = ATR × this. Higher = wider stop, smaller size. |
 | `RISK_REWARD` | `1.5` | Take-profit distance as a multiple of the stop distance. |
@@ -356,8 +371,11 @@ baseline**, chosen to be transparent rather than optimised:
   feels too choppy (lots of quick in-and-out trades), slow it down with
   `EMA_FAST=12` `EMA_SLOW=26`, or `21/55` for a calmer, trend-only feel. For more
   reactivity, `5/13`. Fast must always be **less than** slow.
-- **RSI 14, gates 70 / 30** — standard. Widening the gates (e.g. `75 / 25`) lets
-  more trend-continuation trades through; tightening blocks more.
+- **RSI 14, `RSI_MODE=confirm` (midline 50)** — by default RSI must *agree* with
+  the cross: a long needs RSI ≥ 50, a short needs RSI ≤ 50, so momentum has to back
+  the signal. Set `RSI_MIDLINE=55/45` to demand stronger momentum (fewer trades).
+  Set `RSI_MODE=filter` for the old overbought/oversold veto (`RSI_OVERBOUGHT`/
+  `RSI_OVERSOLD`), which rarely triggers at a fresh cross.
 - **ATR 14 × 1.5** — sets the stop distance. On M5 the spread is a larger share of
   a small ATR, so many M5 traders widen this to **`ATR_MULTIPLIER=2.0`** so normal
   noise and the spread don't stop them out prematurely. A wider stop means a
@@ -373,6 +391,32 @@ baseline**, chosen to be transparent rather than optimised:
 > single good-looking afternoon. A backtest can rule out disasters but cannot prove
 > an edge. If you want to compare settings properly, ask and I'll add a
 > walk-forward backtester that replays history through this exact pipeline.
+
+### Whipsaw filters (regime + timing)
+
+An EMA crossover bleeds when it trades in a range or in thin hours. Two **structural**
+filters fight that — both default ON, both env-tunable, and both honoured in the
+backtester so your results reflect them:
+
+- **Higher-timeframe trend gate (`REQUIRE_HTF_ALIGN=true`).** Only take an M5 long
+  when the `HTF_TIMEFRAME` (default M15) trend is UP, and a short only when it's
+  DOWN. Counter-trend crosses — the bulk of whipsaw — are skipped. If the HTF trend
+  can't be read, entries are skipped (safe). This is the single most effective
+  filter; set `REQUIRE_HTF_ALIGN=false` to disable.
+- **Session filter (`SESSION_FILTER=true`).** Only *open* new trades inside
+  `SESSION_START_HOUR`–`SESSION_END_HOUR` (UTC, default 07–16 = London + the
+  London/NY overlap). Open trades are still managed and closed any time. The window
+  may wrap past midnight (e.g. start 22, end 6). Set `SESSION_FILTER=false` for 24h.
+- **ADX trend-strength gate (`REQUIRE_ADX=true`, `ADX_MIN=20`).** The HTF gate says
+  *which way* the trend is; ADX says *whether there's a trend at all*. Entries are
+  skipped when ADX is below `ADX_MIN` (i.e. the market is ranging) — the most direct
+  filter against the chop where a crossover bleeds. Set `REQUIRE_ADX=false` to disable.
+
+Recommended first pass for cutting whipsaw: keep both of these on, use
+`RSI_MODE=confirm`, leave EMA periods at 9/21, and judge changes on **out-of-sample**
+walk-forward results — not in-sample. Backtest both gates explicitly with
+`python -m bot.backtest --demo --htf-gate --session` (or `--no-htf-gate` /
+`--no-session` to compare).
 
 ## Troubleshooting
 

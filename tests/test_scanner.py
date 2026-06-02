@@ -38,6 +38,28 @@ def test_hold_is_not_tradable():
     assert not s.tradable and "no entry" in s.skip_reason
 
 
+def test_htf_gate_blocks_counter_trend_long():
+    # BUY against a DOWN higher-timeframe trend is gated out when alignment required.
+    s = _score(action=Action.BUY, htf_trend="DOWN", require_htf_align=True)
+    assert not s.tradable and "gated" in s.skip_reason
+
+
+def test_htf_gate_allows_aligned_long():
+    s = _score(action=Action.BUY, htf_trend="UP", require_htf_align=True)
+    assert s.tradable
+
+
+def test_htf_gate_blocks_unknown_trend():
+    s = _score(action=Action.BUY, htf_trend=None, require_htf_align=True)
+    assert not s.tradable and "unknown" in s.skip_reason
+
+
+def test_htf_gate_off_allows_counter_trend():
+    # Without the gate, a counter-trend signal is still tradable (just scored lower).
+    s = _score(action=Action.BUY, htf_trend="DOWN", require_htf_align=False)
+    assert s.tradable
+
+
 def test_zero_atr_not_tradable():
     s = _score(atr=0.0)
     assert not s.tradable and "atr" in s.skip_reason.lower()

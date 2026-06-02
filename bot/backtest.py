@@ -39,9 +39,38 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-from .indicators import add_indicators
+from .config import in_trading_session
+from .indicators import add_indicators, ema
 from .risk import DailyState, Decision, RiskManager, SymbolSpec
-from .strategy import Action, PositionSide, evaluate
+from .strategy import Action, PositionSide, evaluate, trend_ride_exit
+
+
+# Map our timeframe codes to pandas resample rules for the causal HTF trend gate.
+_HTF_RULE = {"M1": "1min", "M5": "5min", "M15": "15min", "M30": "30min",
+             "H1": "1h", "H4": "4h", "D1": "1D"}
+
+
+def _causal_htf_trend(df: pd.DataFrame, htf_tf: str, ema_fast: int, ema_slow: int):
+    """Higher-timeframe EMA trend ('UP'/'DOWN'/None) aligned to ``df``'s index.
+
+    STRICTLY CAUSAL: each HTF bar's trend is stamped at the bar's CLOSE time (the
+    resample label is the interval start) and forward-filled onto the lower-timeframe
+    index, so a decision on bar t can only ever see HTF bars that had already closed
+    by t — no peeking at a still-forming HTF candle. Returns None if the data can't
+    support the HTF EMAs (then the caller simply skips the gate)."""
+    if not isinstance(df.index, pd.DatetimeIndex):
+        return None
+    rule = _HTF_RULE.get((htf_tf or "M15").upper(), "15min")
+    agg = df.resample(rule).agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last"}).dropna()
+    if len(agg) < ema_slow + 1:
+        return None
+    ef = ema(agg["close"], ema_fast)
+    es = ema(agg["close"], ema_slow)
+    trend = pd.Series(np.where(ef >= es, "UP", "DOWN"), index=agg.index, dtype=object)
+    trend[ef.isna() | es.isna()] = None          # warmup -> unknown
+    trend.index = trend.index + pd.Timedelta(rule)  # stamp at interval CLOSE time
+    return trend.reindex(df.index, method="ffill")
 
 
 @dataclass
@@ -51,7 +80,11 @@ class StrategyParams:
     rsi_period: int = 14
     rsi_overbought: float = 70.0
     rsi_oversold: float = 30.0
+    rsi_mode: str = "filter"      # "confirm" or "filter" (see strategy.evaluate)
+    rsi_midline: float = 50.0
     atr_period: int = 14
+    adx_period: int = 14
+    adx_min: float = 0.0          # trend-strength gate; 0 disables (e.g. 20 to require a trend)
     atr_multiplier: float = 1.5
     risk_reward: float = 1.5
 
@@ -93,7 +126,9 @@ def _summarize(trades: List[dict], starting_equity: float) -> Dict:
                 "max_drawdown": 0.0, "final_equity": starting_equity, "return_pct": 0.0}
     pnls = np.array([t["pnl"] for t in trades], dtype=float)
     rs = np.array([t["r_multiple"] for t in trades], dtype=float)
-    wins = pnls[pnls >= 0]
+    # Only strictly-positive P&L counts as a win; break-even/scratch trades (pnl==0)
+    # are neither wins nor losses, so they don't inflate the win rate.
+    wins = pnls[pnls > 0]
     losses = pnls[pnls < 0]
     gp = float(wins.sum())
     gl = float(-losses.sum())
@@ -125,8 +160,37 @@ def run_backtest(
     max_daily_loss: float = 0.03,
     costs: Optional[CostModel] = None,
     symbol_spec: Optional[SymbolSpec] = None,
+    ride_trend_after_tp: bool = False,
+    risk_mode: str = "fixed",
+    tiers=None,
+    require_htf_align: bool = False,
+    htf_timeframe: str = "M15",
+    session_filter: bool = False,
+    session_start_hour: int = 7,
+    session_end_hour: int = 16,
+    trail_after_tp: bool = False,
+    trail_atr_mult: float = 1.5,
+    partial_tp_enabled: bool = False,
+    partial_tp_fraction: float = 0.5,
+    partial_tp_r: float = 1.0,
 ) -> BacktestResult:
-    """Replay ``df`` (OHLC, UTC DatetimeIndex) through the live strategy + risk code."""
+    """Replay ``df`` (OHLC, UTC DatetimeIndex) through the live strategy + risk code.
+
+    ``ride_trend_after_tp`` mirrors the live RIDE_TREND_AFTER_TP setting: when True
+    the position is NOT closed at the take-profit. Instead, once a bar reaches the
+    target the stop is moved to break-even (entry) and the trade rides the move,
+    exiting on the first closed bar that fails to make a higher high (LONG) / lower
+    low (SHORT) — the exact rule in ``strategy.trend_ride_exit``. This keeps the
+    backtest faithful to how the bot actually exits in its default configuration.
+
+    ``risk_mode`` / ``tiers`` mirror the live RiskManager so position sizing in the
+    backtest matches live sizing (fixed 1% vs equity-tiered).
+
+    ``require_htf_align`` applies the same higher-timeframe trend gate the scanner
+    uses live, computed causally from a resample of this data (``htf_timeframe``).
+    ``session_filter`` restricts entries to the [session_start_hour, session_end_hour)
+    UTC window. Both keep the backtest faithful to the live entry rules.
+    """
     params = params or StrategyParams()
     costs = costs or CostModel()
     spec = symbol_spec or SymbolSpec()
@@ -134,9 +198,17 @@ def run_backtest(
     enriched = add_indicators(
         df, ema_fast=params.ema_fast, ema_slow=params.ema_slow,
         rsi_period=params.rsi_period, atr_period=params.atr_period,
+        adx_period=params.adx_period,
+    )
+    # Causal higher-timeframe trend, aligned to the M5 index (None if data too short
+    # to compute it — in which case the gate is simply skipped).
+    htf_trend_series = (
+        _causal_htf_trend(enriched, htf_timeframe, params.ema_fast, params.ema_slow)
+        if require_htf_align else None
     )
     risk = RiskManager(
         risk_per_trade=risk_per_trade, max_daily_loss=max_daily_loss,
+        risk_mode=risk_mode, tiers=tiers,
         max_open_positions=1, atr_multiplier=params.atr_multiplier,
         risk_reward=params.risk_reward, symbol_spec=spec,
     )
@@ -175,16 +247,75 @@ def run_backtest(
         if pos is not None:
             exit_price = None
             reason = None
+            # The hard stop is ALWAYS checked first (worst-case fill assumption).
             if pos["side"] is PositionSide.LONG:
                 if bar["low"] <= pos["sl"]:
                     exit_price, reason = pos["sl"], "SL"
-                elif bar["high"] >= pos["tp"]:
-                    exit_price, reason = pos["tp"], "TP"
             else:  # SHORT
                 if bar["high"] >= pos["sl"]:
                     exit_price, reason = pos["sl"], "SL"
-                elif bar["low"] <= pos["tp"]:
+
+            # Partial take-profit: if not stopped out this bar, bank a fraction at the
+            # partial target (partial_tp_r in R) and move the remainder to break-even.
+            # One-shot per position. Modelled before the TP/ride logic so the remainder
+            # is what rides on.
+            if (exit_price is None and partial_tp_enabled
+                    and not pos.get("partial_done")):
+                pdirn = 1.0 if pos["side"] is PositionSide.LONG else -1.0
+                ptp = pos["entry"] + pdirn * partial_tp_r * pos["stop_distance"]
+                phit = ((pos["side"] is PositionSide.LONG and bar["high"] >= ptp)
+                        or (pos["side"] is PositionSide.SHORT and bar["low"] <= ptp))
+                if phit:
+                    close_lots = round(pos["lots"] * partial_tp_fraction, 2)
+                    rem = round(pos["lots"] - close_lots, 2)
+                    if close_lots >= spec.volume_min and rem >= spec.volume_min:
+                        pnl_part = _close_pnl({**pos, "lots": close_lots}, ptp, spec, costs)
+                        equity += pnl_part
+                        realized_today += pnl_part
+                        trades.append(_trade_row(
+                            {**pos, "lots": close_lots,
+                             "risk_amount": pos["risk_amount"] * partial_tp_fraction},
+                            ptp, bar_time, pnl_part, "partial-TP"))
+                        eq_points.append((bar_time, equity))
+                        pos["lots"] = rem
+                        pos["partial_done"] = True
+                        pos["sl"] = pos["entry"]  # remainder to break-even
+                        if daily_obj().loss_fraction() >= max_daily_loss:
+                            halted = True
+
+            if exit_price is None and not ride_trend_after_tp:
+                # Classic fixed-TP exit.
+                if pos["side"] is PositionSide.LONG and bar["high"] >= pos["tp"]:
                     exit_price, reason = pos["tp"], "TP"
+                elif pos["side"] is PositionSide.SHORT and bar["low"] <= pos["tp"]:
+                    exit_price, reason = pos["tp"], "TP"
+            elif exit_price is None and ride_trend_after_tp:
+                # Trend-ride: don't close at TP. When the target is first reached,
+                # latch it and move the stop to break-even (entry); then exit on the
+                # first closed bar that fails a higher high / lower low. Mirrors live.
+                prev_bar = enriched.iloc[i - 1]
+                dec = trend_ride_exit(
+                    side=pos["side"], take_profit=pos["tp"],
+                    prev_high=float(prev_bar["high"]), prev_low=float(prev_bar["low"]),
+                    last_high=float(bar["high"]), last_low=float(bar["low"]),
+                    tp_reached=pos.get("tp_reached", False),
+                )
+                if dec.tp_reached and not pos.get("tp_reached", False):
+                    pos["tp_reached"] = True
+                    pos["sl"] = pos["entry"]  # H3: lock in break-even once target hit
+                # ATR trailing once the target is reached: ratchet the stop in the
+                # trade's favour so a deep reversal gives back less. Takes effect on
+                # the NEXT bar (sl is updated after this bar's stop check).
+                if pos.get("tp_reached") and trail_after_tp:
+                    bar_atr = float(bar["atr"]) if not pd.isna(bar["atr"]) else 0.0
+                    if bar_atr > 0:
+                        if pos["side"] is PositionSide.LONG:
+                            pos["sl"] = max(pos["sl"], float(bar["close"]) - trail_atr_mult * bar_atr)
+                        else:
+                            pos["sl"] = min(pos["sl"], float(bar["close"]) + trail_atr_mult * bar_atr)
+                if dec.should_close:
+                    exit_price, reason = float(bar["close"]), "trend-ride"
+
             if exit_price is not None:
                 pnl = _close_pnl(pos, exit_price, spec, costs)
                 equity += pnl
@@ -199,7 +330,10 @@ def run_backtest(
         if pos is not None:
             win = enriched.iloc[max(0, i - 1):i + 1]
             sig = evaluate(win, rsi_overbought=params.rsi_overbought,
-                           rsi_oversold=params.rsi_oversold, open_side=pos["side"])
+                           rsi_oversold=params.rsi_oversold,
+                           rsi_mode=params.rsi_mode, rsi_midline=params.rsi_midline,
+                           adx_min=params.adx_min,
+                           open_side=pos["side"])
             if sig.action is Action.CLOSE:
                 exit_price = float(bar["close"])
                 pnl = _close_pnl(pos, exit_price, spec, costs)
@@ -215,7 +349,23 @@ def run_backtest(
         if pos is None and not halted and i + 1 < n:
             win = enriched.iloc[max(0, i - 1):i + 1]
             sig = evaluate(win, rsi_overbought=params.rsi_overbought,
-                           rsi_oversold=params.rsi_oversold, open_side=None)
+                           rsi_oversold=params.rsi_oversold,
+                           rsi_mode=params.rsi_mode, rsi_midline=params.rsi_midline,
+                           adx_min=params.adx_min,
+                           open_side=None)
+            # Session filter: only open inside the configured UTC hour window.
+            if (sig.action in (Action.BUY, Action.SELL) and session_filter
+                    and has_time and not in_trading_session(
+                        bar_time.hour, session_start_hour, session_end_hour)):
+                continue
+            # HTF hard-gate: skip entries that disagree with the higher-timeframe
+            # trend (or whose HTF trend is unknown at this bar).
+            if sig.action in (Action.BUY, Action.SELL) and require_htf_align \
+                    and htf_trend_series is not None:
+                want = "UP" if sig.action is Action.BUY else "DOWN"
+                htf_now = htf_trend_series.iloc[i]
+                if htf_now != want:
+                    continue
             if sig.action in (Action.BUY, Action.SELL):
                 decision = risk.evaluate(
                     sig, equity=equity, open_positions=0, daily=daily_obj(),
@@ -235,6 +385,8 @@ def run_backtest(
                         "side": side, "entry": entry, "sl": sl, "tp": tp,
                         "lots": plan.lots, "risk_amount": plan.risk_amount,
                         "open_time": enriched.index[i + 1], "reason_open": plan.reason,
+                        "tp_reached": False, "stop_distance": dist,
+                        "partial_done": False,
                     }
 
     # Close any still-open position at the last bar's close (mark-to-market exit).
@@ -622,7 +774,10 @@ def _params_from_settings() -> StrategyParams:
         return StrategyParams(
             ema_fast=s.ema_fast, ema_slow=s.ema_slow, rsi_period=s.rsi_period,
             rsi_overbought=s.rsi_overbought, rsi_oversold=s.rsi_oversold,
+            rsi_mode=s.rsi_mode, rsi_midline=s.rsi_midline,
             atr_period=s.atr_period, atr_multiplier=s.atr_multiplier,
+            adx_period=s.adx_period,
+            adx_min=(s.adx_min if s.require_adx else 0.0),
             risk_reward=s.risk_reward,
         )
     except Exception:
@@ -646,6 +801,20 @@ def main(argv=None) -> int:
     p.add_argument("--commission", type=float, default=0.0, help="commission per lot (round-turn).")
     p.add_argument("--report", action="store_true", help="write a self-contained HTML report (single run).")
     p.add_argument("--metric", default="net_pnl", help="heatmap metric (net_pnl/profit_factor/return_pct/avg_r).")
+    p.add_argument("--ride-trend", dest="ride_trend", action="store_true", default=None,
+                   help="model trend-ride exits (default: from .env RIDE_TREND_AFTER_TP).")
+    p.add_argument("--no-ride-trend", dest="ride_trend", action="store_false",
+                   help="force classic fixed-TP exits in the backtest.")
+    p.add_argument("--risk-mode", choices=["fixed", "tiered"], default=None,
+                   help="position sizing mode (default: from .env RISK_MODE).")
+    p.add_argument("--htf-gate", dest="htf_gate", action="store_true", default=None,
+                   help="require higher-timeframe trend alignment (default: from .env REQUIRE_HTF_ALIGN).")
+    p.add_argument("--no-htf-gate", dest="htf_gate", action="store_false",
+                   help="disable the higher-timeframe alignment gate.")
+    p.add_argument("--session", dest="session", action="store_true", default=None,
+                   help="only enter inside the trading-session hours (default: from .env SESSION_FILTER).")
+    p.add_argument("--no-session", dest="session", action="store_false",
+                   help="disable the session filter (trade any hour).")
     args = p.parse_args(argv)
 
     if args.csv:
@@ -658,7 +827,38 @@ def main(argv=None) -> int:
             print("(no --csv/--symbol given; using --demo synthetic data)")
 
     costs = CostModel(spread_price=args.spread, commission_per_lot=args.commission)
-    bt_kwargs = dict(starting_equity=args.equity, risk_per_trade=args.risk, costs=costs)
+    # Default trend-ride / risk-mode to the live .env config so the backtest matches
+    # how the bot actually trades; CLI flags override.
+    htf_tf = "M15"
+    sess_start, sess_end = 7, 16
+    trail, trail_mult = False, 1.5
+    ptp_on, ptp_frac, ptp_r = False, 0.5, 1.0
+    try:
+        from .config import Settings
+        _s = Settings.load()
+        ride = args.ride_trend if args.ride_trend is not None else _s.ride_trend_after_tp
+        rmode = args.risk_mode or _s.risk_mode
+        htf_gate = args.htf_gate if args.htf_gate is not None else _s.require_htf_align
+        session = args.session if args.session is not None else _s.session_filter
+        htf_tf = _s.htf_timeframe
+        sess_start, sess_end = _s.session_start_hour, _s.session_end_hour
+        trail, trail_mult = _s.trail_after_tp, _s.trail_atr_mult
+        ptp_on, ptp_frac, ptp_r = _s.partial_tp_enabled, _s.partial_tp_fraction, _s.partial_tp_r
+    except Exception:
+        ride = bool(args.ride_trend)
+        rmode = args.risk_mode or "fixed"
+        htf_gate = bool(args.htf_gate)
+        session = bool(args.session)
+    bt_kwargs = dict(starting_equity=args.equity, risk_per_trade=args.risk, costs=costs,
+                     ride_trend_after_tp=ride, risk_mode=rmode,
+                     require_htf_align=htf_gate, htf_timeframe=htf_tf,
+                     session_filter=session, session_start_hour=sess_start,
+                     session_end_hour=sess_end,
+                     trail_after_tp=trail, trail_atr_mult=trail_mult,
+                     partial_tp_enabled=ptp_on, partial_tp_fraction=ptp_frac,
+                     partial_tp_r=ptp_r)
+    print(f"(backtest config: ride_trend={ride}, risk_mode={rmode}, "
+          f"htf_gate={htf_gate}, session={session} [{sess_start:02d}-{sess_end:02d} UTC])")
     out_dir = Path(__file__).resolve().parent.parent / "logs"
     out_dir.mkdir(parents=True, exist_ok=True)
 

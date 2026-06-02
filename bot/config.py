@@ -63,6 +63,20 @@ def _parse_symbols(raw: Optional[str], fallback: str) -> List[str]:
     return out or [fallback]
 
 
+def in_trading_session(hour: int, start_hour: int, end_hour: int) -> bool:
+    """True if ``hour`` (0-23 UTC) is inside the [start, end) trading window.
+
+    Pure and testable. Supports windows that wrap past midnight (start > end);
+    start == end is treated as a 24-hour, always-open window.
+    """
+    hour %= 24
+    if start_hour == end_hour:
+        return True
+    if start_hour < end_hour:
+        return start_hour <= hour < end_hour
+    return hour >= start_hour or hour < end_hour  # wraps midnight
+
+
 class TradingMode(str, Enum):
     DEMO = "DEMO"
     LIVE = "LIVE"
@@ -120,6 +134,7 @@ class Settings:
     scan_top_n: int        # max concurrent positions when scan_mode != "best"
     scan_min_score: float  # skip opportunities scoring below this (0..1); 0 = trade best
     htf_timeframe: str     # higher timeframe used for trend-alignment ranking (e.g. M15)
+    require_htf_align: bool # HARD gate: only trade when the M5 signal agrees with the HTF trend
 
     # --- Strategy params ---
     ema_fast: int
@@ -127,10 +142,20 @@ class Settings:
     rsi_period: int
     rsi_overbought: float
     rsi_oversold: float
+    rsi_mode: str          # "confirm" (RSI must agree with the cross) or "filter" (legacy veto)
+    rsi_midline: float     # confirm-mode threshold: long needs RSI >= this, short <= this
     atr_period: int
+    adx_period: int        # ADX lookback (trend-strength)
+    adx_min: float         # minimum ADX to allow an entry; ignored unless require_adx
+    require_adx: bool      # HARD gate: only trade when ADX >= adx_min (skip chop)
     atr_multiplier: float
     risk_reward: float
     ride_trend_after_tp: bool  # once target hit, hold & trail on closes instead of closing at TP
+
+    # --- Session filter (UTC) ---
+    session_filter: bool   # when True, only OPEN new trades inside the hour window below
+    session_start_hour: int  # inclusive UTC hour the trading window opens (0-23)
+    session_end_hour: int    # exclusive UTC hour the window closes (1-24; may wrap past midnight)
 
     # --- Risk params ---
     risk_per_trade: float       # fraction of equity, e.g. 0.01 = 1%
@@ -138,6 +163,17 @@ class Settings:
     risk_mode: str              # 'tiered' (scale risk by equity) or 'fixed'
     max_daily_loss: float       # fraction of start-of-day equity, e.g. 0.03 = 3%
     max_open_positions: int
+    max_total_drawdown: float   # halt new entries if peak->equity drawdown exceeds this (0 = off)
+    max_consecutive_losses: int # halt new entries for the day after this many losses in a row (0 = off)
+    max_per_currency: int       # cap concurrent positions sharing a currency (correlation guard)
+    max_spread_points: int      # execution refuses a fill if live spread exceeds this (points; 0 = off)
+
+    # --- Exit management ---
+    trail_after_tp: bool        # once target hit, trail the stop by ATR (on top of break-even)
+    trail_atr_mult: float       # trailing-stop distance = ATR x this
+    partial_tp_enabled: bool    # bank part of the position at partial_tp_r, ride the rest
+    partial_tp_fraction: float  # fraction of the position to close at the partial target (0..1)
+    partial_tp_r: float         # partial target distance, in R (multiples of the stop distance)
 
     # --- Runtime ---
     history_bars: int           # how many candles to pull each cycle
@@ -197,20 +233,44 @@ class Settings:
             scan_top_n=_env_int("SCAN_TOP_N", 3) or 3,
             scan_min_score=_env_float("SCAN_MIN_SCORE", 0.0),
             htf_timeframe=(os.getenv("HTF_TIMEFRAME") or "M15").strip().upper(),
+            require_htf_align=_env_bool("REQUIRE_HTF_ALIGN", True),
             ema_fast=_env_int("EMA_FAST", 9) or 9,
             ema_slow=_env_int("EMA_SLOW", 21) or 21,
             rsi_period=_env_int("RSI_PERIOD", 14) or 14,
             rsi_overbought=_env_float("RSI_OVERBOUGHT", 70.0),
             rsi_oversold=_env_float("RSI_OVERSOLD", 30.0),
+            rsi_mode=(os.getenv("RSI_MODE") or "confirm").strip().lower(),
+            rsi_midline=_env_float("RSI_MIDLINE", 50.0),
             atr_period=_env_int("ATR_PERIOD", 14) or 14,
+            adx_period=_env_int("ADX_PERIOD", 14) or 14,
+            adx_min=_env_float("ADX_MIN", 20.0),
+            require_adx=_env_bool("REQUIRE_ADX", True),
             atr_multiplier=_env_float("ATR_MULTIPLIER", 1.5),
             risk_reward=_env_float("RISK_REWARD", 1.5),
             ride_trend_after_tp=_env_bool("RIDE_TREND_AFTER_TP", True),
+            session_filter=_env_bool("SESSION_FILTER", True),
+            # NB: don't use "or" defaults here — hour 0 (midnight UTC) is valid and
+            # would be wrongly coerced to the default. _env_int returns the int default
+            # when unset, so the value is always an int.
+            session_start_hour=_env_int("SESSION_START_HOUR", 7),
+            session_end_hour=_env_int("SESSION_END_HOUR", 16),
             risk_per_trade=_env_float("RISK_PER_TRADE", 0.01),
             max_risk_per_trade=_env_float("MAX_RISK_PER_TRADE", 0.02),
-            risk_mode=(os.getenv("RISK_MODE") or "tiered").strip().lower(),
+            # Default is the conservative, documented 1% FIXED model. "tiered" must
+            # be opted into explicitly (it scales risk up on small accounts and is
+            # validated against hard caps in assert_safe_to_run).
+            risk_mode=(os.getenv("RISK_MODE") or "fixed").strip().lower(),
             max_daily_loss=_env_float("MAX_DAILY_LOSS", 0.03),
             max_open_positions=_env_int("MAX_OPEN_POSITIONS", 1) or 1,
+            max_total_drawdown=_env_float("MAX_TOTAL_DRAWDOWN", 0.15),
+            max_consecutive_losses=_env_int("MAX_CONSECUTIVE_LOSSES", 6) or 0,
+            max_per_currency=_env_int("MAX_PER_CURRENCY", 1) or 1,
+            max_spread_points=_env_int("MAX_SPREAD_POINTS", 0) or 0,
+            trail_after_tp=_env_bool("TRAIL_AFTER_TP", True),
+            trail_atr_mult=_env_float("TRAIL_ATR_MULT", 1.5),
+            partial_tp_enabled=_env_bool("PARTIAL_TP_ENABLED", True),
+            partial_tp_fraction=_env_float("PARTIAL_TP_FRACTION", 0.5),
+            partial_tp_r=_env_float("PARTIAL_TP_R", 1.0),
             history_bars=_env_int("HISTORY_BARS", 600) or 600,
             magic_number=_env_int("MAGIC_NUMBER", 250531) or 250531,
             deviation_points=_env_int("DEVIATION_POINTS", 20) or 20,
@@ -233,17 +293,78 @@ class Settings:
             raise RuntimeError(
                 f"ema_fast ({self.ema_fast}) must be < ema_slow ({self.ema_slow})."
             )
-        if not (0 < self.risk_per_trade <= 0.05):
+        if self.risk_mode not in {"fixed", "tiered"}:
             raise RuntimeError(
-                f"risk_per_trade ({self.risk_per_trade}) outside sane range (0, 0.05]."
+                f"risk_mode ({self.risk_mode}) must be 'fixed' or 'tiered'."
             )
-        if not (0 < self.max_daily_loss <= 0.20):
-            raise RuntimeError(
-                f"max_daily_loss ({self.max_daily_loss}) outside sane range (0, 0.20]."
-            )
+        if self.risk_mode == "tiered":
+            # In tiered mode the effective risk comes from the tier TABLE, not from
+            # risk_per_trade / max_daily_loss. Validate every tier so an aggressive
+            # (or typo'd) table can never silently run. The caps are higher than the
+            # fixed-mode ceilings because tiered is an explicit, eyes-open choice —
+            # but they still bound the absolute blast radius.
+            from .risk import DEFAULT_RISK_TIERS  # local import avoids load-time cycle
+            tier_risk_cap = 0.25   # max fraction of equity risked on a single trade
+            tier_daily_cap = 0.50  # max fraction of start-of-day equity lost in a day
+            for tier in DEFAULT_RISK_TIERS:
+                rpt = tier.get("risk_per_trade", 0.0)
+                mdl = tier.get("max_daily_loss", 0.0)
+                if not (0 < rpt <= tier_risk_cap):
+                    raise RuntimeError(
+                        f"tiered risk_per_trade ({rpt}) for min_equity "
+                        f"{tier.get('min_equity')} outside (0, {tier_risk_cap}]."
+                    )
+                if not (0 < mdl <= tier_daily_cap):
+                    raise RuntimeError(
+                        f"tiered max_daily_loss ({mdl}) for min_equity "
+                        f"{tier.get('min_equity')} outside (0, {tier_daily_cap}]."
+                    )
+        else:  # fixed
+            if not (0 < self.risk_per_trade <= 0.05):
+                raise RuntimeError(
+                    f"risk_per_trade ({self.risk_per_trade}) outside sane range (0, 0.05]."
+                )
+            if not (0 < self.max_daily_loss <= 0.20):
+                raise RuntimeError(
+                    f"max_daily_loss ({self.max_daily_loss}) outside sane range (0, 0.20]."
+                )
         if self.scan_mode not in {"best", "top_n", "any"}:
             raise RuntimeError(
                 f"scan_mode ({self.scan_mode}) must be one of: best, top_n, any."
+            )
+        if self.rsi_mode not in {"confirm", "filter"}:
+            raise RuntimeError(
+                f"rsi_mode ({self.rsi_mode}) must be 'confirm' or 'filter'."
+            )
+        if not (0.0 <= self.adx_min <= 100.0):
+            raise RuntimeError(
+                f"adx_min ({self.adx_min}) must be between 0 and 100."
+            )
+        if not (0.0 <= self.max_total_drawdown <= 1.0):
+            raise RuntimeError(
+                f"max_total_drawdown ({self.max_total_drawdown}) must be between 0 and 1."
+            )
+        if self.max_consecutive_losses < 0:
+            raise RuntimeError("max_consecutive_losses cannot be negative.")
+        if self.max_per_currency < 1:
+            raise RuntimeError("max_per_currency must be at least 1.")
+        if self.max_spread_points < 0:
+            raise RuntimeError("max_spread_points cannot be negative.")
+        if self.trail_atr_mult <= 0:
+            raise RuntimeError("trail_atr_mult must be positive.")
+        if not (0.0 < self.partial_tp_fraction < 1.0):
+            raise RuntimeError(
+                f"partial_tp_fraction ({self.partial_tp_fraction}) must be between 0 and 1 (exclusive)."
+            )
+        if self.partial_tp_r <= 0:
+            raise RuntimeError("partial_tp_r must be positive.")
+        if not (0 <= self.session_start_hour <= 23):
+            raise RuntimeError(
+                f"session_start_hour ({self.session_start_hour}) must be 0-23."
+            )
+        if not (1 <= self.session_end_hour <= 24):
+            raise RuntimeError(
+                f"session_end_hour ({self.session_end_hour}) must be 1-24."
             )
 
     def banner(self) -> str:
@@ -251,11 +372,18 @@ class Settings:
         mode = "LIVE" if self.is_live else "DEMO"
         scope = (f"{len(self.symbols)} symbols (scan:{self.scan_mode})"
                  if len(self.symbols) > 1 else self.symbol)
+        # In tiered mode the per-trade / daily-stop fractions are equity-dependent,
+        # so don't print a single misleading number — say "tiered" instead.
+        if self.risk_mode == "tiered":
+            risk_txt = "risk TIERED (scales by equity), "
+        else:
+            risk_txt = (f"risk {self.risk_per_trade:.1%}/trade, "
+                        f"daily-stop {self.max_daily_loss:.1%}, ")
         return (
             f"[{mode}] {scope} {self.timeframe} | "
             f"EMA {self.ema_fast}/{self.ema_slow} RSI{self.rsi_period} "
             f"ATR{self.atr_period}x{self.atr_multiplier} | "
-            f"risk {self.risk_per_trade:.1%}/trade, daily-stop {self.max_daily_loss:.1%}, "
+            f"{risk_txt}"
             f"R:R 1:{self.risk_reward} | kill_switch={self.kill_switch}"
         )
 

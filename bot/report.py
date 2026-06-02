@@ -186,7 +186,9 @@ def summarize(df: pd.DataFrame, period_label: str = "all") -> Summary:
     if "close_time_utc" in df.columns:
         df = df.sort_values("close_time_utc")
     pnl = df["pnl"].fillna(0.0)
-    wins_mask = pnl >= 0
+    # Only strictly-positive P&L is a win; break-even trades (pnl==0) are not counted
+    # as wins so the win rate isn't inflated.
+    wins_mask = pnl > 0
     wins = df[wins_mask]
     losses = df[~wins_mask]
     gross_profit = float(wins["pnl"].sum()) if not wins.empty else 0.0
