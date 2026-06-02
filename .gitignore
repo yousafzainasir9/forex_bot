@@ -1,0 +1,21 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.python-version.local
+
+# uv
+# (uv.lock SHOULD be committed; .venv should not)
+
+# Logs & runtime artifacts
+logs/
+*.log
+*.csv
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

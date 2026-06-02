@@ -1,0 +1,10 @@
+{
+  "tests/test_webapp.py::test_index_serves_html": true,
+  "tests/test_webapp.py::test_status_endpoint": true,
+  "tests/test_webapp.py::test_trades_all": true,
+  "tests/test_webapp.py::test_trades_today_filter": true,
+  "tests/test_webapp.py::test_trades_bad_period": true,
+  "tests/test_webapp.py::test_kill_toggle": true,
+  "tests/test_webapp.py::test_log_endpoint": true,
+  "tests/test_webapp.py::test_bot_control_bad_action": true
+}

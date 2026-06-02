@@ -1,0 +1,521 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Forex Bot — Live Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+  :root{--bg:#0e1117;--panel:#161b22;--panel2:#1c2230;--line:#2a3140;--txt:#e6edf3;
+        --muted:#8b949e;--green:#2ea043;--red:#f85149;--accent:#58a6ff;--amber:#d29922}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+       font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  header{padding:16px 24px;border-bottom:1px solid var(--line);display:flex;
+         align-items:center;gap:14px;flex-wrap:wrap}
+  header h1{font-size:17px;margin:0;font-weight:600}
+  .pill{font-size:11px;padding:3px 9px;border-radius:999px;border:1px solid var(--line)}
+  .pill.demo{color:var(--accent);border-color:var(--accent)}
+  .pill.live{color:var(--amber);border-color:var(--amber)}
+  .dot{width:9px;height:9px;border-radius:50%;display:inline-block;margin-right:5px;vertical-align:middle}
+  .on{background:var(--green)} .off{background:var(--red)} .warn{background:var(--amber)}
+  .spacer{flex:1}
+  .controls{display:flex;gap:8px;flex-wrap:wrap}
+  .btn{background:var(--panel2);border:1px solid var(--line);color:var(--txt);
+       padding:7px 13px;border-radius:8px;cursor:pointer;font-size:13px}
+  .btn:hover{border-color:var(--accent)}
+  .btn.danger{border-color:var(--red);color:var(--red)} .btn.danger:hover{background:rgba(248,81,73,.1)}
+  .btn.go{border-color:var(--green);color:var(--green)} .btn.go:hover{background:rgba(46,160,67,.1)}
+  .btn.active{background:var(--accent);color:#04101f;border-color:var(--accent);font-weight:600}
+  .wrap{padding:18px 24px;max-width:1200px;margin:0 auto}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:18px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:13px 15px;position:relative}
+  .card .label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.04em;display:flex;align-items:center;gap:5px}
+  .card .val{font-size:21px;font-weight:700;margin-top:6px}
+  .info{display:inline-flex;width:14px;height:14px;border-radius:50%;border:1px solid var(--muted);
+        color:var(--muted);font-size:10px;align-items:center;justify-content:center;cursor:help;
+        font-style:normal;font-weight:700;line-height:1}
+  .tip{position:absolute;left:12px;top:100%;margin-top:6px;z-index:40;background:#0a0d12;
+       border:1px solid var(--line);color:#c9d1d9;font-size:12px;line-height:1.55;padding:10px 12px;
+       border-radius:8px;width:250px;max-width:80vw;display:none;box-shadow:0 8px 24px rgba(0,0,0,.55);
+       text-transform:none;letter-spacing:normal;font-weight:400}
+  .card:hover .tip{display:block}
+  .pos{color:var(--green)} .neg{color:var(--red)} .muted{color:var(--muted)}
+  .row{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:18px}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+  .panel h3{margin:0 0 10px;font-size:13px;font-weight:600;color:var(--muted)}
+  .filters{display:flex;gap:7px;flex-wrap:wrap;margin-bottom:14px;align-items:center}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:right;padding:7px 9px;border-bottom:1px solid var(--line);white-space:nowrap}
+  th:first-child,td:first-child,th:nth-child(2),td:nth-child(2){text-align:left}
+  th{color:var(--muted);font-weight:600;cursor:pointer}
+  th[title]{text-decoration:underline dotted;text-underline-offset:3px}
+  tbody tr:hover{background:var(--panel2)}
+  .empty{color:var(--muted);text-align:center;padding:26px;font-size:13px}
+  .log{background:#0a0d12;border:1px solid var(--line);border-radius:8px;padding:10px;
+       font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;color:#c9d1d9;
+       max-height:260px;overflow:auto;white-space:pre-wrap}
+  .custom{display:flex;gap:6px;align-items:center;margin-left:auto;color:var(--muted);font-size:12px}
+  .custom input{background:var(--panel2);border:1px solid var(--line);color:var(--txt);padding:5px;border-radius:6px;font-size:12px}
+  .small{font-size:11px;color:var(--muted)}
+  @media(max-width:820px){.row{grid-template-columns:1fr}}
+  .help{background:var(--panel);border:1px solid var(--line);border-radius:12px;margin-bottom:18px;overflow:hidden}
+  .help summary{cursor:pointer;list-style:none;padding:13px 16px;font-size:13px;font-weight:600;
+                color:var(--txt);display:flex;align-items:center;gap:8px}
+  .help summary::-webkit-details-marker{display:none}
+  .help summary .chev{color:var(--muted);transition:transform .15s}
+  .help[open] summary .chev{transform:rotate(90deg)}
+  .help .body{padding:0 18px 16px;font-size:13px;line-height:1.65;color:#c9d1d9}
+  .help .body h4{margin:14px 0 5px;font-size:13px;color:var(--txt)}
+  .help .body p{margin:6px 0}
+  .help .body code{background:var(--panel2);padding:1px 5px;border-radius:4px;font-size:12px}
+  .help .one{background:var(--panel2);border-left:3px solid var(--accent);padding:9px 12px;border-radius:0 6px 6px 0;margin:10px 0;color:var(--txt)}
+  .help .warn-note{color:var(--amber);font-size:12px;margin-top:12px}
+  .banner{border-radius:12px;padding:11px 16px;margin-bottom:16px;font-size:13px;display:none;
+          border:1px solid var(--line)}
+  .banner.closed{display:block;background:rgba(210,153,34,.12);border-color:var(--amber);color:#e8c97a}
+  .banner.openmkt{display:block;background:rgba(46,160,67,.10);border-color:var(--green);color:#7ee2a0}
+  .banner b{color:#fff}
+</style>
+</head>
+<body>
+<header>
+  <h1>Forex Bot</h1>
+  <span class="pill" id="modePill">—</span>
+  <span class="small" id="sym">—</span>
+  <span class="spacer"></span>
+  <span class="small" id="clock" style="margin-right:14px"></span>
+  <span class="small"><span class="dot off" id="botDot"></span><span id="botState">bot: ?</span></span>
+  <div class="controls">
+    <button class="btn go" id="startBtn">Start bot</button>
+    <button class="btn danger" id="stopBtn">Stop bot</button>
+    <button class="btn" id="killBtn">Kill switch: ?</button>
+  </div>
+</header>
+
+<div class="wrap">
+  <div id="mktBanner" class="banner"></div>
+  <details class="help" id="help">
+    <summary><span class="chev">▶</span> How this bot works (click to expand)</summary>
+    <div class="body">
+      <p>The bot watches one currency pair (default <code>EUR/USD</code>) and checks
+      it once every 15 minutes. Each check it does one of four things:
+      <b>BUY</b>, <b>SELL</b>, <b>CLOSE</b>, or <b>HOLD</b> (do nothing). It decides
+      using three simple tools stacked together:</p>
+
+      <h4>1. Direction — two moving averages crossing</h4>
+      <p>A moving average is the average price over the last N bars, redrawn each
+      bar as a smooth line. The bot tracks a <b>fast</b> line (9 bars) and a
+      <b>slow</b> line (21 bars). Fast crossing <b>above</b> slow = price turning up
+      → a BUY idea. Crossing <b>below</b> = turning down → a SELL idea.</p>
+
+      <h4>2. Momentum filter — RSI</h4>
+      <p>RSI is a 0–100 gauge of how stretched price is. Above 70 = "overbought"
+      (already ran up a lot); below 30 = "oversold" (already fell a lot). The bot
+      only BUYs if RSI is below 70, and only SELLs if RSI is above 30 — so it
+      doesn't chase a move that may be exhausted.</p>
+
+      <h4>3. Safety net — ATR-based stop &amp; target</h4>
+      <p>ATR measures the pair's typical move per bar (its "normal wiggle"). Every
+      trade gets a <b>stop-loss</b> (auto-close if it goes against you) 1.5×ATR away,
+      and a <b>take-profit</b> 1.5× further than the stop — aiming to earn 1.5× what a
+      loser costs (a 1 : 1.5 risk/reward).</p>
+
+      <p>The bot also <b>exits early</b> if the lines cross back the other way, and
+      otherwise just <b>HOLDs</b> — sitting out is a deliberate choice.</p>
+
+      <div class="one">In one line: buy when the trend turns up and isn't overbought,
+      sell when it turns down and isn't oversold, always with a protective stop,
+      and otherwise wait.</div>
+
+      <h4>Money rules</h4>
+      <p>Risks <b>1% of the account per trade</b> (position size is computed so a
+      stop-out costs ~1%), keeps <b>at most 1 trade open</b>, and <b>halts for the day</b>
+      if losses reach <b>3%</b> of the day's starting balance.</p>
+
+      <p class="warn-note">⚠️ This is a deliberately simple <b>learning</b> strategy on a
+      DEMO account — not a proven money-maker. Hover any figure below for its
+      definition.</p>
+    </div>
+  </details>
+
+  <div class="cards" id="liveCards"></div>
+
+  <div class="panel" style="margin-bottom:18px">
+    <h3 style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+      <span>Live M5 chart <span id="chartSym" class="small"></span></span>
+      <label class="small" style="display:flex;align-items:center;gap:5px;margin-left:auto">
+        Symbol
+        <select id="symSel" class="btn" style="padding:5px 8px"></select>
+      </label>
+    </h3>
+    <div class="small" style="margin:-4px 0 8px;color:var(--muted)">candles + EMA 9/21; last candle updates live for the bot's primary pair</div>
+    <div id="chart" style="height:340px;width:100%"></div>
+    <div id="chartMsg" class="small"></div>
+  </div>
+
+  <div class="panel" id="scanPanel" style="margin-bottom:18px">
+    <h3>Watchlist scanner <span id="scanMeta" class="small"></span></h3>
+    <div id="scanWrap"><div class="empty">Waiting for the bot to publish a scan (run main.py)…</div></div>
+    <div id="scanMsg" class="small" style="margin-top:8px"></div>
+  </div>
+  <div class="panel" style="margin-bottom:18px">
+    <h3>Open positions &amp; last signal</h3>
+    <div id="positions"></div>
+    <div id="lastSignal" class="small" style="margin-top:10px"></div>
+    <div id="snapAge" class="small" style="margin-top:6px"></div>
+  </div>
+
+  <div class="filters" id="filters">
+    <button class="btn" data-p="today">Today</button>
+    <button class="btn" data-p="yesterday">Yesterday</button>
+    <button class="btn" data-p="2d">2d</button>
+    <button class="btn" data-p="3d">3d</button>
+    <button class="btn" data-p="week">Week</button>
+    <button class="btn" data-p="month">Month</button>
+    <button class="btn active" data-p="all">All</button>
+    <span class="custom">
+      <label>From <input type="date" id="from"/></label>
+      <label>To <input type="date" id="to"/></label>
+      <button class="btn" data-p="custom">Apply</button>
+    </span>
+  </div>
+
+  <div class="cards" id="perfCards"></div>
+
+  <div class="row">
+    <div class="panel"><h3>Equity curve (cumulative net P&amp;L)</h3><canvas id="equity" height="200"></canvas></div>
+    <div class="panel"><h3>P&amp;L by day</h3><canvas id="daily" height="200"></canvas></div>
+  </div>
+
+  <div class="panel" style="margin-bottom:18px">
+    <h3>Trades</h3>
+    <div id="tableWrap"></div>
+  </div>
+
+  <div class="panel">
+    <h3>Activity log (bot.log)</h3>
+    <div class="log" id="log">loading…</div>
+  </div>
+</div>
+
+<script>
+const DEFS={
+  equity:"Equity is your account's real-time value: balance plus the floating (unrealised) profit or loss of any open trades. It's what the account would be worth if every open position closed right now.",
+  balance:"Balance is settled cash from trades that have already closed. It does NOT include the floating P&L of open positions, so it only changes when a trade closes (or on deposits/withdrawals).",
+  price:"Live price is the broker's current quote for the pair. Bid is the price you can SELL at, ask is the price you can BUY at; the gap between them is the spread — a cost you pay on every trade.",
+  dailypnl:"Daily P&L is the realised profit or loss from trades that CLOSED today (UTC). Trades still open are not counted here until they close.",
+  dailyloss:"How much of today's max-daily-loss limit has been used. When it reaches 100%, the risk manager halts all new entries until tomorrow (UTC).",
+  source:"Where these numbers come from: 'live MT5' is a real-time read from the terminal; 'snapshot' is the last status the bot wrote on its previous loop (up to one timeframe old).",
+  result:"Whether the selected period is net positive (PROFIT), net negative (LOSS), or break-even (FLAT), after costs.",
+  netpnl:"Total profit minus total losses over the selected period, after commission and swap. This is the bottom line.",
+  trades:"Number of closed trades in the period, split into winners (W) and losers (L).",
+  winrate:"Share of trades that closed at or above breakeven. A high win rate alone doesn't mean profitable — the size of wins versus losses matters just as much.",
+  pf:"Profit factor = gross profit ÷ gross loss. Above 1.0 means winners outweigh losers; 2.0 means you made twice what you lost. Below 1.0 is a losing system.",
+  expectancy:"Average net P&L per trade over the period. Positive means the typical trade makes money; it's net P&L ÷ number of trades.",
+  avgr:"Average result measured in 'R', where 1R is the amount risked on each trade (1% of equity here). +0.5R means the average trade returned half of what it risked.",
+  risktier:"How much of equity the bot risks on each trade. In tiered mode this scales with your balance: ~20% under $100 down to 1% at $1,000+, so a small account still makes meaningful moves while a larger one stays conservative.",
+  maxdd:"Maximum drawdown: the largest peak-to-trough drop in cumulative P&L over the period — your worst losing stretch, measured in money."
+};
+let period="all", sortKey="close_time_utc", sortDir=-1, eqChart=null, dayChart=null, killOn=false;
+let pxChart=null, candleSeries=null, emaFastS=null, emaSlowS=null, lastClosedT=0, forming=null, tfSecs=300;
+let chartFitted=false; const VIEW_BARS=60;  // default visible window (recent candles)
+let selectedSym=null, primarySym=null, chartCurSym=null;  // null selectedSym = follow the bot's active symbol
+let activeSyms=new Set();  // symbols with an open position right now (drives the ACTIVE tag in the scanner)
+const $=id=>document.getElementById(id);
+const money=v=>(v>=0?"+":"")+(+v).toFixed(2);
+const cls=v=>v>0?"pos":(v<0?"neg":"");
+// Round a price to remove floating-point noise (e.g. 1.163250000000000 -> 1.16325)
+// without hard-coding digits per instrument.
+const fmtPx=v=>(v==null||v===""||isNaN(v))?'—':Number(Number(v).toPrecision(7)).toString();
+const TZ=Intl.DateTimeFormat().resolvedOptions().timeZone||"local";
+const TZLABEL=(()=>{try{return new Intl.DateTimeFormat(undefined,{timeZoneName:'short'}).formatToParts(new Date()).find(p=>p.type==='timeZoneName').value;}catch(e){return TZ;}})();
+function fmtLocal(input){ if(!input) return '—'; const d=(typeof input==='number')?new Date(input*1000):new Date(input); if(isNaN(d)) return '—';
+  return d.toLocaleString(undefined,{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit',hour12:true})+' '+TZLABEL; }
+function fmtClock(){ return new Date().toLocaleString(undefined,{weekday:'short',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:true})+' '+TZLABEL; }
+function humanDur(sec){ sec=Math.max(0,sec|0); const d=Math.floor(sec/86400),h=Math.floor(sec%86400/3600),m=Math.floor(sec%3600/60);
+  return (d?d+'d ':'')+(h?h+'h ':'')+m+'m'; }
+async function jget(u){const r=await fetch(u);return r.json();}
+async function jpost(u,b){const r=await fetch(u,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b||{})});return r.json();}
+
+function card(label,valHtml,tip){
+  const ic = tip? ' <span class="info" aria-label="info">i</span>' : "";
+  const tp = tip? `<span class="tip">${tip}</span>` : "";
+  return `<div class="card"><div class="label">${label}${ic}</div><div class="val">${valHtml}</div>${tp}</div>`;
+}
+
+async function refreshStatus(){
+  let d; try{d=await jget("/api/status");}catch(e){return;}
+  const cfg=d.config||{}, snap=d.snapshot||{}, live=d.live;
+  primarySym=cfg.symbol||primarySym; populateSymSel(cfg);
+  $("modePill").textContent=cfg.mode||"—";
+  $("modePill").className="pill "+((cfg.mode==="LIVE")?"live":"demo");
+  const wl=(cfg.watchlist_size||1);
+  const charted=(selectedSym||chartCurSym||snap.symbol||cfg.symbol||"?");
+  const chartedLabel=charted+(selectedSym?" (manual)":"");
+  $("sym").textContent = wl>1
+    ? `${wl} symbols · ${cfg.timeframe||"?"} · charting ${chartedLabel}`
+    : `${cfg.symbol||"?"} · ${cfg.timeframe||"?"}`;
+
+  $("botDot").className="dot "+(d.bot_running?"on":"off");
+  $("botState").textContent="bot: "+(d.bot_running?"running":"stopped");
+  killOn=!!d.kill_switch;
+  $("killBtn").textContent="Kill switch: "+(killOn?"ON":"OFF");
+  $("killBtn").classList.toggle("active",killOn);
+
+  const equity = (live&&live.equity!=null)?live.equity : snap.equity;
+  const bal = (live&&live.balance!=null)?live.balance : snap.balance;
+  const cur = (live&&live.currency)||snap.currency||"";
+  const px = live?(live.bid!=null?`${fmtPx(live.bid)} / ${fmtPx(live.ask)}`:"—"):"—";
+  if(live && live.bid!=null && chartCurSym && chartCurSym===primarySym) updateForming(+live.bid);
+  const dlf = (snap.daily_loss_fraction||0), mdl=(snap.max_daily_loss||cfg.max_daily_loss||0);
+  $("liveCards").innerHTML=[
+    card("Equity", equity!=null?`${(+equity).toFixed(2)} <span class="small">${cur}</span>`:'<span class="muted">—</span>', DEFS.equity),
+    card("Balance", bal!=null?`${(+bal).toFixed(2)}`:'<span class="muted">—</span>', DEFS.balance),
+    card("Live price", `<span style="font-size:16px">${px}</span>`, DEFS.price),
+    card("Daily P&L", `<span class="${cls(snap.daily_realized_pnl||0)}">${money(snap.daily_realized_pnl||0)}</span>`, DEFS.dailypnl),
+    card("Daily loss vs cap", `${(dlf*100).toFixed(2)}% <span class="small">/ ${(mdl*100).toFixed(0)}%</span>`, DEFS.dailyloss),
+    card("Data source", live?'<span class="pos" style="font-size:14px">live MT5</span>':'<span style="font-size:14px">snapshot</span>', DEFS.source),
+    card("Risk / trade", (snap.risk? ((snap.risk.per_trade*100).toFixed(snap.risk.per_trade<0.1?0:0)+'%'+(snap.risk.mode==='tiered'?' <span class=\"small\">tier</span>':'')) : '—'), DEFS.risktier),
+  ].join("");
+
+  const pos=snap.open_positions||[];
+  activeSyms=new Set(pos.map(p=>(p.symbol||"").toUpperCase()).filter(Boolean));
+  $("positions").innerHTML = pos.length? (
+    `<table><thead><tr>`+
+    `<th title="The traded instrument">Symbol</th>`+
+    `<th title="Broker's unique id for this position">Ticket</th>`+
+    `<th title="LONG = bought (profits if price rises); SHORT = sold (profits if price falls)">Side</th>`+
+    `<th title="Trade size in lots. 1.00 lot = 100,000 units of the base currency">Lots</th>`+
+    `<th title="Price at which the position was opened">Entry</th>`+
+    `<th title="Stop-loss: price where the trade auto-closes to cap the loss">SL</th>`+
+    `<th title="Take-profit: price where the trade auto-closes to bank the gain">TP</th>`+
+    `<th title="Floating (unrealised) profit/loss at the current price — not yet locked in">Float P&L</th>`+
+    `<th></th>`+
+    `</tr></thead><tbody>`+
+    pos.map(p=>{const dash=v=>(v==null||v==='')?'—':v; const tag=(p.bot===false)?' <span class="pill" style="border-color:var(--muted);color:var(--muted)" title="Not opened by this bot (different magic number)">manual</span>':'';
+      const closeBtn=`<button class="btn danger" style="padding:4px 10px;font-size:12px" onclick="closeTrade('${p.ticket}','${(p.symbol||'').replace(/'/g,'')}')">Close</button>`;
+      return `<tr><td><b>${p.symbol||'—'}</b>${tag}</td><td>${p.ticket}</td><td>${p.side}</td><td>${dash(p.lots)}</td><td>${fmtPx(p.entry)}</td><td>${fmtPx(p.stop_loss)}</td><td>${fmtPx(p.take_profit)}</td><td class="${cls(p.profit)}">${p.profit==null?'—':money(p.profit)}</td><td>${closeBtn}</td></tr>`;}).join("")+
+    `</tbody></table>`) : '<div class="empty">No open positions.</div>';
+  const sig=snap.last_signal;
+  $("lastSignal").innerHTML = sig? `Last signal: <b>${sig.action}</b> — ${sig.reason} (px ${sig.price}, RSI ${(+sig.rsi).toFixed(1)}) · bar ${fmtLocal(sig.time)}` : "Last signal: —";
+  $("snapAge").textContent = snap.updated_utc? `snapshot updated ${fmtLocal(snap.updated_utc)}` : "waiting for first bot loop…";
+  renderMarket(d.market);
+}
+
+async function refreshTrades(){
+  let q=`/api/trades?period=${encodeURIComponent(period)}`;
+  if(period==="custom"){q+=`&from=${$("from").value}&to=${$("to").value}`;}
+  let d; try{d=await jget(q);}catch(e){return;}
+  if(d.error){$("perfCards").innerHTML=card("Error",d.error);return;}
+  const s=d.summary||{}, rows=d.trades||[];
+  const pf = s.profit_factor===null?"∞":(+s.profit_factor).toFixed(2);
+  const verdict = s.net_pnl>0?"PROFIT":(s.net_pnl<0?"LOSS":"FLAT");
+  $("perfCards").innerHTML=[
+    card("Result",`<span class="${cls(s.net_pnl)}">${verdict}</span>`, DEFS.result),
+    card("Net P&L",`<span class="${cls(s.net_pnl)}">${money(s.net_pnl||0)}</span>`, DEFS.netpnl),
+    card("Trades",`${s.n_trades||0} <span class="small">(${s.wins||0}W/${s.losses||0}L)</span>`, DEFS.trades),
+    card("Win rate",`${((s.win_rate||0)*100).toFixed(1)}%`, DEFS.winrate),
+    card("Profit factor",pf, DEFS.pf),
+    card("Expectancy",`<span class="${cls(s.expectancy)}">${money(s.expectancy||0)}</span>`, DEFS.expectancy),
+    card("Avg R",`<span class="${cls(s.avg_r)}">${((s.avg_r||0)>=0?"+":"")+(+s.avg_r||0).toFixed(2)}</span>`, DEFS.avgr),
+    card("Max drawdown",`${(+s.max_drawdown||0).toFixed(2)}`, DEFS.maxdd),
+  ].join("");
+  renderCharts(rows); renderTable(rows);
+}
+
+function renderCharts(rows){
+  const r=rows.filter(t=>t.close_time_utc).map(t=>({...t,_c:new Date(t.close_time_utc)})).sort((a,b)=>a._c-b._c);
+  let cum=0;const el=[],ed=[];r.forEach(t=>{cum+=(+t.pnl||0);el.push(t.close_time_utc.slice(0,16).replace("T"," "));ed.push(+cum.toFixed(2));});
+  const byDay={};r.forEach(t=>{const d=t.close_time_utc.slice(0,10);byDay[d]=(byDay[d]||0)+(+t.pnl||0);});
+  const dl=Object.keys(byDay).sort(),dd=dl.map(d=>+byDay[d].toFixed(2));
+  if(!window.Chart)return;
+  if(eqChart)eqChart.destroy();
+  eqChart=new Chart($("equity"),{type:"line",data:{labels:el,datasets:[{data:ed,borderColor:"#58a6ff",
+    backgroundColor:"rgba(88,166,255,.12)",fill:true,tension:.2,pointRadius:0,borderWidth:2}]},
+    options:{plugins:{legend:{display:false}},scales:{x:{ticks:{color:"#8b949e",maxTicksLimit:6},grid:{color:"#2a3140"}},y:{ticks:{color:"#8b949e"},grid:{color:"#2a3140"}}}}});
+  if(dayChart)dayChart.destroy();
+  dayChart=new Chart($("daily"),{type:"bar",data:{labels:dl,datasets:[{data:dd,backgroundColor:dd.map(v=>v>=0?"#2ea043":"#f85149")}]},
+    options:{plugins:{legend:{display:false}},scales:{x:{ticks:{color:"#8b949e",maxTicksLimit:8},grid:{display:false}},y:{ticks:{color:"#8b949e"},grid:{color:"#2a3140"}}}}});
+}
+
+function renderTable(rows){
+  if(!rows.length){$("tableWrap").innerHTML='<div class="empty">No trades in this period.</div>';return;}
+  const cols=[["close_time_utc","Close (UTC)","When the trade closed (UTC)"],
+    ["symbol","Symbol","The traded instrument"],
+    ["side","Side","LONG = bought, SHORT = sold"],
+    ["lots","Lots","Trade size; 1.00 lot = 100,000 units"],
+    ["entry","Entry","Price the trade opened at"],
+    ["exit","Exit","Price the trade closed at"],
+    ["pnl","Net P&L","Realised profit/loss after commission and swap"],
+    ["r_multiple","R","Result in units of risk (1R = amount risked)"]];
+  const sorted=rows.slice().sort((a,b)=>{let x=a[sortKey],y=b[sortKey];
+    if(typeof x==="string"){return sortDir*(""+x).localeCompare(""+y);} return sortDir*((+x||0)-(+y||0));});
+  const head="<tr>"+cols.map(([k,l,t])=>`<th data-k="${k}" title="${t}">${l}${sortKey===k?(sortDir>0?" ▲":" ▼"):""}</th>`).join("")+"</tr>";
+  const body=sorted.map(t=>`<tr><td>${(t.close_time_utc||"").slice(0,16).replace("T"," ")}</td><td>${t.symbol||""}</td><td>${t.side||""}</td><td>${t.lots}</td><td>${t.entry}</td><td>${t.exit}</td><td class="${cls(t.pnl)}">${money(t.pnl||0)}</td><td class="${cls(t.r_multiple)}">${((t.r_multiple||0)>=0?"+":"")+(+t.r_multiple||0).toFixed(2)}</td></tr>`).join("");
+  $("tableWrap").innerHTML=`<table><thead>${head}</thead><tbody>${body}</tbody></table>`;
+  document.querySelectorAll("th[data-k]").forEach(th=>th.onclick=()=>{const k=th.dataset.k;if(sortKey===k)sortDir*=-1;else{sortKey=k;sortDir=-1;}renderTable(rows);});
+}
+
+async function refreshLog(){let d;try{d=await jget("/api/log?lines=200");}catch(e){return;}
+  $("log").textContent=(d.lines||[]).join("\n")||"(log empty)";$("log").scrollTop=$("log").scrollHeight;}
+
+document.querySelectorAll(".btn[data-p]").forEach(b=>b.onclick=()=>{
+  if(b.dataset.p!=="custom"){document.querySelectorAll(".btn[data-p]").forEach(x=>x.classList.remove("active"));b.classList.add("active");}
+  period=b.dataset.p;refreshTrades();});
+async function closeTrade(ticket, sym){
+  if(!confirm(`Close ${sym||''} position ${ticket} now at market?`)) return;
+  let r; try{ r=await jpost("/api/control/close",{ticket:ticket}); }catch(e){ r=null; }
+  if(r && r.ok){ refreshStatus(); refreshTrades(); }
+  else { alert("Close failed: "+((r&&(r.error||r.detail))||"no response")); }
+}
+$("symSel").onchange=(e)=>{ selectedSym=e.target.value||null; chartFitted=false; lastClosedT=0; forming=null;
+  if(candleSeries){ try{candleSeries.setData([]);emaFastS.setData([]);emaSlowS.setData([]);}catch(_){} }
+  $("chartMsg").textContent="loading "+(selectedSym||"auto")+"…"; refreshChart(); refreshStatus(); };
+$("killBtn").onclick=async()=>{const r=await jpost("/api/control/kill",{on:!killOn});killOn=!!r.kill_switch;refreshStatus();};
+$("startBtn").onclick=async()=>{await jpost("/api/control/bot",{action:"start"});setTimeout(refreshStatus,800);};
+$("stopBtn").onclick=async()=>{await jpost("/api/control/bot",{action:"stop"});setTimeout(refreshStatus,800);};
+
+const TF_SECS={M1:60,M5:300,M15:900,M30:1800,H1:3600,H4:14400,D1:86400};
+
+function initChart(){
+  if(pxChart || !window.LightweightCharts) {
+    if(!window.LightweightCharts) $("chartMsg").textContent="(chart library blocked — check internet/CDN access)";
+    return;
+  }
+  const el=$("chart");
+  pxChart=LightweightCharts.createChart(el,{
+    width:el.clientWidth, height:340,
+    layout:{background:{color:"#161b22"},textColor:"#8b949e"},
+    grid:{vertLines:{color:"#2a3140"},horzLines:{color:"#2a3140"}},
+    rightPriceScale:{borderColor:"#2a3140"},
+    crosshair:{mode:0},
+    localization:{ timeFormatter:(t)=> new Date(t*1000).toLocaleString(undefined,{day:"2-digit",month:"short",hour:"2-digit",minute:"2-digit",hour12:true}) },
+    timeScale:{borderColor:"#2a3140",timeVisible:true,secondsVisible:false,
+      tickMarkFormatter:(t)=> new Date(t*1000).toLocaleTimeString(undefined,{hour:"2-digit",minute:"2-digit",hour12:false}) }
+  });
+  candleSeries=pxChart.addCandlestickSeries({upColor:"#2ea043",downColor:"#f85149",
+    borderVisible:false,wickUpColor:"#2ea043",wickDownColor:"#f85149"});
+  emaFastS=pxChart.addLineSeries({color:"#58a6ff",lineWidth:2,priceLineVisible:false,lastValueVisible:false});
+  emaSlowS=pxChart.addLineSeries({color:"#d29922",lineWidth:2,priceLineVisible:false,lastValueVisible:false});
+  window.addEventListener("resize",()=>{ if(pxChart) pxChart.applyOptions({width:el.clientWidth}); });
+}
+
+function populateSymSel(cfg){
+  const sel=$("symSel"); if(!sel) return;
+  const syms=cfg.symbols||[];
+  if(sel.dataset.filled==="1" && sel.options.length===syms.length+1) return;  // already built
+  const cur=selectedSym||"";
+  sel.innerHTML='<option value="">Auto (bot’s pick)</option>'+
+    syms.map(x=>`<option value="${x}">${x}</option>`).join("");
+  sel.value=cur; sel.dataset.filled="1";
+}
+
+async function refreshChart(){
+  if(!pxChart) initChart();
+  if(!pxChart) return;
+  const url="/api/candles"+(selectedSym?("?symbol="+encodeURIComponent(selectedSym)):"");
+  let d; try{ d=await jget(url); }catch(e){ return; }
+  const c=d.candles||[];
+  $("chartSym").textContent = d.symbol? `(${d.symbol} ${d.timeframe||""})${selectedSym?" · manual":" · auto"}` : "";
+  chartCurSym=(d.symbol||"").toUpperCase();
+  tfSecs=TF_SECS[d.timeframe]||300;
+  if(!c.length){
+    $("chartMsg").textContent = selectedSym
+      ? `No live data for ${selectedSym} — MT5 offline, or the broker doesn't offer it.`
+      : "Waiting for the bot to publish candles (run main.py)…";
+    return;
+  }
+  $("chartMsg").textContent="";
+  candleSeries.setData(c.map(x=>({time:x.t,open:x.o,high:x.h,low:x.l,close:x.c})));
+  if(d.ema_fast) emaFastS.setData(d.ema_fast.map(p=>({time:p.t,value:p.v})));
+  if(d.ema_slow) emaSlowS.setData(d.ema_slow.map(p=>({time:p.t,value:p.v})));
+  const last=c[c.length-1];
+  lastClosedT=last.t;
+  forming=null;  // reset; a new forming candle is built from ticks after the last close
+  if(!chartFitted){
+    const n=c.length;
+    // show the most recent VIEW_BARS candles, leaving 3 slots on the right for the forming candle
+    pxChart.timeScale().setVisibleLogicalRange({from: Math.max(0, n-VIEW_BARS), to: n+3});
+    chartFitted=true;
+  }
+}
+
+function updateForming(bid){
+  if(!candleSeries || !lastClosedT || !bid) return;
+  const ft=lastClosedT+tfSecs;            // the in-progress candle's open time
+  if(!forming || forming.time!==ft){
+    forming={time:ft,open:bid,high:bid,low:bid,close:bid};
+  } else {
+    forming.high=Math.max(forming.high,bid);
+    forming.low=Math.min(forming.low,bid);
+    forming.close=bid;
+  }
+  try{ candleSeries.update(forming); }catch(e){}
+}
+
+function renderMarket(m){
+  const el=$("mktBanner"); if(!m){ el.className='banner'; return; }
+  if(m.open){
+    el.className='banner openmkt';
+    el.innerHTML='● <b>Market open</b> — live prices flowing. Times shown in your local time ('+TZLABEL+').';
+  } else {
+    el.className='banner closed';
+    el.innerHTML='● <b>Market closed</b> (weekend/after-hours) — the chart shows the last session, prices are frozen, so no new candles or trades. '+
+      'Reopens <b>'+fmtLocal(m.next_open_utc)+'</b> (in '+humanDur(m.seconds_to_open)+'). All times in your local zone ('+TZLABEL+').';
+  }
+}
+function sigCls(a){return a==='BUY'?'pos':(a==='SELL'?'neg':'muted');}
+function trendBadge(t){if(t==='UP')return '<span class="pos">\u25B2 up</span>';if(t==='DOWN')return '<span class="neg">\u25BC dn</span>';return '<span class="muted">\u2014</span>';}
+async function refreshScan(){
+  let d; try{ d=await jget("/api/scan"); }catch(e){ return; }
+  const rows=d.rows||[];
+  $("scanMeta").textContent = rows.length ? `(${rows.length} symbols \u00B7 mode: ${d.scan_mode} \u00B7 trend TF ${d.htf_timeframe||""} \u00B7 updated ${fmtLocal(d.updated_utc)})` : "";
+  if(!rows.length){ $("scanWrap").innerHTML='<div class="empty">Waiting for the bot to publish a scan (run main.py)\u2026</div>'; return; }
+  const active=d.active_symbol, top=d.top;
+  const head=`<tr><th>Symbol</th>`+
+    `<th title="Strategy signal on the latest closed bar">Signal</th>`+
+    `<th title="Opportunity score 0-100: signal strength + volatility + higher-timeframe trend alignment, minus spread cost">Score</th>`+
+    `<th title="ATR as a % of price - how much the symbol is moving">ATR%</th>`+
+    `<th title="Live spread as a share of the planned stop distance (lower is better)">Spread</th>`+
+    `<th title="Higher-timeframe EMA trend; agreement with the signal scores higher">Trend</th>`+
+    `<th title="RSI(14) on the latest closed bar">RSI</th></tr>`;
+  const body=rows.map(r=>{
+    const isAct=r.symbol===active, isTop=r.symbol===top;
+    const isOpen=activeSyms.has((r.symbol||"").toUpperCase());
+    const openTag=isOpen?' <span class="pill" style="border-color:var(--green);color:var(--green)" title="You have an open position on this symbol">\u25CF open</span>':'';
+    const tag=(isTop?' <span class="pill" style="border-color:var(--accent);color:var(--accent)">TOP</span>'
+              :(isAct?' <span class="pill">charted</span>':''))+openTag;
+    const pct=Math.max(0,Math.min(100,(r.score||0)*100));
+    const bar=`<div style="display:flex;align-items:center;gap:6px;justify-content:flex-end">`+
+      `<div style="flex:0 0 56px;height:6px;background:var(--panel2);border-radius:3px;overflow:hidden">`+
+      `<div style="width:${pct}%;height:100%;background:${r.tradable?'var(--green)':'var(--line)'}"></div></div>`+
+      `<span>${r.tradable?pct.toFixed(0):'\u2014'}</span></div>`;
+    const sig = isOpen
+      ? `<span class="pos" style="font-weight:600" title="A position is open on this symbol; the bot manages it (holds/closes) rather than re-entering">ACTIVE</span>`
+      : (r.tradable
+        ? `<span class="${sigCls(r.action)}">${r.action}</span>`
+        : `<span class="muted" title="${(r.skip_reason||r.action).replace(/"/g,'')}">${r.action}${r.skip_reason?' \u26A0':''}</span>`);
+    const rsi=(r.rsi==null)?'\u2014':(+r.rsi).toFixed(0);
+    const spread=(r.spread_frac!=null)?(r.spread_frac*100).toFixed(0)+'%':'\u2014';
+    return `<tr style="${isAct?'background:rgba(88,166,255,.08)':''}">`+
+      `<td><b>${r.symbol}</b>${tag}</td><td>${sig}</td><td>${bar}</td>`+
+      `<td>${(r.atr_pct||0).toFixed(2)}%</td><td>${spread}</td>`+
+      `<td>${trendBadge(r.htf_trend)}</td><td>${rsi}</td></tr>`;
+  }).join("");
+  $("scanWrap").innerHTML=`<table><thead>${head}</thead><tbody>${body}</tbody></table>`;
+  const tradN=rows.filter(r=>r.tradable).length;
+  $("scanMsg").innerHTML = top
+    ? `Strongest right now: <b>${top}</b>. In <code>${d.scan_mode||'best'}</code> mode the bot trades the highest-scoring setup${d.scan_mode==='best'?' (one at a time)':''}.`
+    : `No tradable setups this scan \u2014 ${tradN} of ${rows.length} symbols qualify. The bot waits for a fresh EMA cross.`;
+}
+function tickClock(){ const c=$("clock"); if(c) c.textContent=fmtClock(); }
+function tick(){refreshStatus();refreshLog();refreshScan();tickClock();}
+initChart();refreshChart();refreshStatus();refreshTrades();refreshLog();refreshScan();tickClock();setInterval(tickClock,1000);
+setInterval(tick,5000);
+setInterval(refreshTrades,15000);
+setInterval(refreshChart,15000);
+</script>
+</body>
+</html>
