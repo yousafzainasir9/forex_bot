@@ -41,7 +41,16 @@ def load_trades(csv_path: str | Path) -> pd.DataFrame:
     path = Path(csv_path)
     if not path.exists():
         return pd.DataFrame()
-    df = pd.read_csv(path)
+    # Be tolerant of a corrupt/half-written row (the old concurrent-write bug, or a
+    # line the bot was mid-append to): skip bad lines instead of throwing, so the
+    # dashboard never goes blank on a single malformed row.
+    try:
+        df = pd.read_csv(path, on_bad_lines="skip")
+    except Exception:
+        try:
+            df = pd.read_csv(path, on_bad_lines="skip", engine="python")
+        except Exception:
+            return pd.DataFrame()
     if df.empty:
         return df
     for col in ("close_time_utc", "open_time_utc"):
@@ -50,6 +59,13 @@ def load_trades(csv_path: str | Path) -> pd.DataFrame:
     for col in ("pnl", "commission", "swap", "r_multiple", "lots", "entry", "exit"):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
+    # Text columns: an empty cell (e.g. a backfilled trade with no stored
+    # reason_open) is read by pandas as NaN. Coerce those to "" so the value is a
+    # real string everywhere downstream -- this is the ROOT cause of the blank
+    # history: a NaN here serialised to invalid JSON and killed the whole table.
+    for col in ("symbol", "side", "reason_open", "reason_close"):
+        if col in df.columns:
+            df[col] = df[col].fillna("").astype(str)
     return _dedupe_by_position(df)
 
 

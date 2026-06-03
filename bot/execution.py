@@ -104,6 +104,15 @@ def build_closed_trades_from_deals(
         risk = float(info.get("risk_amount", 0) or 0)
         r_multiple = round(pnl / risk, 3) if risk > 0 else 0.0
 
+        # Backfilled trades have no local open record, so reason_open would be
+        # blank -> NaN in the CSV. Always write a real string: the stored reason
+        # if we have it, otherwise a synthesized one noting it came from history.
+        reason_open = info.get("reason_open") or (
+            f"{side} {float(getattr(in_d, 'volume', 0) or 0)} lots @ "
+            f"{float(getattr(in_d, 'price', 0) or 0)} "
+            f"(recorded from broker history; no local risk record)"
+        )
+
         trades.append(ClosedTrade(
             open_time_utc=_iso_from_epoch(getattr(in_d, "time", 0)),
             close_time_utc=_iso_from_epoch(getattr(out_d, "time", 0)),
@@ -119,7 +128,7 @@ def build_closed_trades_from_deals(
             swap=round(swap, 2),
             r_multiple=r_multiple,
             position_id=int(pid),
-            reason_open=info.get("reason_open", ""),
+            reason_open=reason_open,
             reason_close="position closed (TP/SL/opposite-cross/manual)",
         ))
     return trades

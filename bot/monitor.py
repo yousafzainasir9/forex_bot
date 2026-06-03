@@ -17,9 +17,12 @@ own are captured just like bot-initiated closes.
 
 from __future__ import annotations
 
+import contextlib
 import csv
 import json
 import logging
+import os
+import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -102,6 +105,10 @@ class Monitor:
         self.stats = Stats()
         self._current_day: Optional[date] = None
         self.recorded_position_ids: set[int] = set()
+        # Cross-process lock so the bot and the web app never corrupt
+        # trades.csv with interleaved appends, and so every write sees the
+        # file's current contents (e.g. right after the user clears history).
+        self._lock_path = self.log_dir / "trades.csv.lock"
 
         # --- Configure a dedicated logger (no duplicate handlers on re-init). ---
         self.log = logging.getLogger("forex_bot")
@@ -206,26 +213,81 @@ class Monitor:
     def record_trade(self, trade: ClosedTrade) -> bool:
         """Append a closed trade to the ledger and update running stats.
 
-        Returns False (and does nothing) if this position_id was already recorded,
-        so reconciliation is idempotent across loops and restarts.
+        Idempotent: returns False (and does nothing) if this position_id is
+        already present in the ledger. The dedup decision is made against the CSV
+        file *on disk* (re-read here), not just this process's in-memory set, so:
+          * If the user clears history (empties/deletes trades.csv) while the bot
+            keeps running, previously-seen positions become writable again instead
+            of being silently skipped -- the fix for "history disappears after a
+            clear" and "N trades happened but only N-1 show".
+          * The bot and the web app, running as separate processes, never
+            double-record or clobber each other's rows.
+        The whole read-decide-append runs under a cross-process file lock.
         """
-        if trade.position_id and trade.position_id in self.recorded_position_ids:
-            return False
-        with self.trades_csv.open("a", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow([
-                trade.close_time_utc, trade.open_time_utc, trade.symbol, trade.side,
-                trade.lots, trade.entry, trade.exit, trade.stop_loss, trade.take_profit,
-                trade.pnl, trade.commission, trade.swap, trade.r_multiple,
-                trade.position_id, trade.reason_open, trade.reason_close,
-            ])
-        self._fold_trade(trade.pnl, trade.r_multiple)
-        if trade.position_id:
-            self.recorded_position_ids.add(trade.position_id)
+        with self._csv_lock():
+            # Re-sync stats + dedup set with whatever is actually in the file now.
+            self._resync_from_disk()
+            if trade.position_id and trade.position_id in self.recorded_position_ids:
+                return False
+            self._ensure_csv_header()  # recreate the header if the file was cleared
+            with self.trades_csv.open("a", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow([
+                    trade.close_time_utc, trade.open_time_utc, trade.symbol, trade.side,
+                    trade.lots, trade.entry, trade.exit, trade.stop_loss, trade.take_profit,
+                    trade.pnl, trade.commission, trade.swap, trade.r_multiple,
+                    trade.position_id, trade.reason_open, trade.reason_close,
+                ])
+            self._fold_trade(trade.pnl, trade.r_multiple)
+            if trade.position_id:
+                self.recorded_position_ids.add(trade.position_id)
         self.log.info(
             f"TRADE CLOSED {trade.side} {trade.symbol} pnl={trade.pnl:+.2f} "
             f"R={trade.r_multiple:+.2f} | {trade.reason_close}"
         )
         return True
+
+    def _resync_from_disk(self) -> None:
+        """Rebuild running stats and the dedup set from the current trades.csv so
+        they reflect external edits (history cleared, or rows added by another
+        process). Cheap: the ledger is small and this only runs on a close."""
+        self.stats = Stats()
+        self.recorded_position_ids = set()
+        self._load_existing_trades()
+
+    @contextlib.contextmanager
+    def _csv_lock(self, timeout: float = 10.0, poll: float = 0.05):
+        """Best-effort cross-process exclusive lock around trades.csv, built on an
+        atomic O_CREAT|O_EXCL lock file (works on Windows and POSIX, no third-party
+        deps). Proceeds after ``timeout`` rather than deadlocking, and reclaims a
+        stale lock left behind by a crashed process."""
+        acquired = False
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fd = os.open(str(self._lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.close(fd)
+                acquired = True
+                break
+            except FileExistsError:
+                try:  # reclaim a lock older than the timeout (owner likely died)
+                    if time.time() - os.path.getmtime(self._lock_path) > timeout:
+                        os.unlink(self._lock_path)
+                        continue
+                except OSError:
+                    pass
+                if time.monotonic() >= deadline:
+                    break  # give up waiting; proceed without the lock
+                time.sleep(poll)
+            except OSError:
+                break  # lock dir not writable; proceed unlocked
+        try:
+            yield
+        finally:
+            if acquired:
+                try:
+                    os.unlink(self._lock_path)
+                except OSError:
+                    pass
 
     # --- Summaries -------------------------------------------------------
     def stats_line(self) -> str:

@@ -307,8 +307,10 @@ async function refreshStatus(){
 async function refreshTrades(){
   let q=`/api/trades?period=${encodeURIComponent(period)}`;
   if(period==="custom"){q+=`&from=${$("from").value}&to=${$("to").value}`;}
-  let d; try{d=await jget(q);}catch(e){return;}
-  if(d.error){$("perfCards").innerHTML=card("Error",d.error);return;}
+  let d; try{d=await jget(q);}catch(e){
+    $("tableWrap").innerHTML='<div class="empty">Couldn\'t load trades from the server. Make sure the web app was restarted after the latest code change, then refresh.</div>';
+    return;}
+  if(d.error){$("perfCards").innerHTML=card("Error",d.error);$("tableWrap").innerHTML='<div class="empty">'+d.error+'</div>';return;}
   const s=d.summary||{}, rows=d.trades||[];
   const pf = s.profit_factor===null?"∞":(+s.profit_factor).toFixed(2);
   const verdict = s.net_pnl>0?"PROFIT":(s.net_pnl<0?"LOSS":"FLAT");

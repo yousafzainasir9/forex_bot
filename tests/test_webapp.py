@@ -64,8 +64,8 @@ def test_trades_all(client):
     assert d["summary"]["n_trades"] == 2
     assert d["summary"]["net_pnl"] == pytest.approx(83.0)
     assert len(d["trades"]) == 2
-    # sorted ascending by close time
-    assert d["trades"][0]["close_time_utc"] < d["trades"][1]["close_time_utc"]
+    # newest trade first (latest close on top)
+    assert d["trades"][0]["close_time_utc"] > d["trades"][1]["close_time_utc"]
 
 
 def test_trades_today_filter(client):
