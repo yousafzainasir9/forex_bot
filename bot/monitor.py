@@ -17,9 +17,12 @@ own are captured just like bot-initiated closes.
 
 from __future__ import annotations
 
+import contextlib
 import csv
 import json
 import logging
+import os
+import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -103,6 +106,7 @@ class Monitor:
         self.stats = Stats()
         self._current_day: Optional[date] = None
         self.recorded_position_ids: set[int] = set()
+        self._lock_path = self.log_dir / "trades.csv.lock"
 
         # --- Configure a dedicated logger (no duplicate handlers on re-init). ---
         self.log = logging.getLogger("forex_bot")
@@ -212,26 +216,67 @@ class Monitor:
     def record_trade(self, trade: ClosedTrade) -> bool:
         """Append a closed trade to the ledger and update running stats.
 
-        Returns False (and does nothing) if this position_id was already recorded,
-        so reconciliation is idempotent across loops and restarts.
+        Idempotent against the CSV file *on disk* (re-read here), not just this
+        process's in-memory set, so clearing history makes positions writable again
+        and the bot + web app never double-record or clobber each other's rows.
+        The whole read-decide-append runs under a cross-process file lock.
         """
-        if trade.position_id and trade.position_id in self.recorded_position_ids:
-            return False
-        with self.trades_csv.open("a", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow([
-                trade.close_time_utc, trade.open_time_utc, trade.symbol, trade.side,
-                trade.lots, trade.entry, trade.exit, trade.stop_loss, trade.take_profit,
-                trade.pnl, trade.commission, trade.swap, trade.r_multiple,
-                trade.position_id, trade.reason_open, trade.reason_close,
-            ])
-        self._fold_trade(trade.pnl, trade.r_multiple)
-        if trade.position_id:
-            self.recorded_position_ids.add(trade.position_id)
+        with self._csv_lock():
+            self._resync_from_disk()
+            if trade.position_id and trade.position_id in self.recorded_position_ids:
+                return False
+            self._ensure_csv_header()
+            with self.trades_csv.open("a", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow([
+                    trade.close_time_utc, trade.open_time_utc, trade.symbol, trade.side,
+                    trade.lots, trade.entry, trade.exit, trade.stop_loss, trade.take_profit,
+                    trade.pnl, trade.commission, trade.swap, trade.r_multiple,
+                    trade.position_id, trade.reason_open, trade.reason_close,
+                ])
+            self._fold_trade(trade.pnl, trade.r_multiple)
+            if trade.position_id:
+                self.recorded_position_ids.add(trade.position_id)
         self.log.info(
             f"TRADE CLOSED {trade.side} {trade.symbol} pnl={trade.pnl:+.2f} "
             f"R={trade.r_multiple:+.2f} | {trade.reason_close}"
         )
         return True
+
+    def _resync_from_disk(self) -> None:
+        """Rebuild stats + dedup set from the current trades.csv so they reflect
+        external edits (history cleared, or rows added by another process)."""
+        self.stats = Stats()
+        self.recorded_position_ids = set()
+        self._load_existing_trades()
+
+    @contextlib.contextmanager
+    def _csv_lock(self, timeout: float = 10.0, poll: float = 0.05):
+        """Best-effort cross-process exclusive lock around trades.csv via an atomic
+        O_CREAT|O_EXCL lock file. Proceeds after ``timeout`` rather than
+        deadlocking, and reclaims a stale lock left by a crashed process."""
+        acquired = False
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fd = os.open(str(self._lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.close(fd); acquired = True; break
+            except FileExistsError:
+                try:
+                    if time.time() - os.path.getmtime(self._lock_path) > timeout:
+                        os.unlink(self._lock_path); continue
+                except OSError:
+                    pass
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(poll)
+            except OSError:
+                break
+        try:
+            yield
+        finally:
+            if acquired:
+                try: os.unlink(self._lock_path)
+                except OSError: pass
 
     # --- Summaries -------------------------------------------------------
     def stats_line(self) -> str:

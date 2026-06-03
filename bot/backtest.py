@@ -265,8 +265,15 @@ def run_backtest(
                     and not pos.get("partial_done")):
                 pdirn = 1.0 if pos["side"] is PositionSide.LONG else -1.0
                 ptp = pos["entry"] + pdirn * partial_tp_r * pos["stop_distance"]
-                phit = ((pos["side"] is PositionSide.LONG and bar["high"] >= ptp)
-                        or (pos["side"] is PositionSide.SHORT and bar["low"] <= ptp))
+                # Half-a-tick tolerance: a bar that EXACTLY touches the partial
+                # target must count as a hit. Without it, floating-point error in
+                # ``entry + r*stop_distance`` (e.g. 1.1+0.0015 = 1.10150000000000015)
+                # can sit a few 1e-16 above the bar's high and silently skip the
+                # partial. The tolerance is far below one price tick, so it can
+                # never register a level the bar didn't actually reach.
+                _tol = spec.point * 0.5
+                phit = ((pos["side"] is PositionSide.LONG and bar["high"] >= ptp - _tol)
+                        or (pos["side"] is PositionSide.SHORT and bar["low"] <= ptp + _tol))
                 if phit:
                     close_lots = round(pos["lots"] * partial_tp_fraction, 2)
                     rem = round(pos["lots"] - close_lots, 2)

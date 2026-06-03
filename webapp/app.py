@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import subprocess
 import sys
 import threading
@@ -397,6 +398,27 @@ def _reconcile_closed() -> int:
         return 0
 
 
+def _json_safe(obj):
+    """Recursively replace NaN / Infinity with None so the payload is STRICT JSON.
+    Flask's jsonify emits bare ``NaN``/``Infinity`` tokens, which are invalid JSON
+    and make the browser's JSON.parse throw -- blanking the whole trades table when
+    even one field (e.g. an empty reason_open on a backfilled trade) is NaN.
+    """
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    # numpy scalars / pandas NaT and the like: catch any self-unequal NaN value
+    try:
+        if obj != obj:  # noqa: PLR0124  (NaN is the only value != itself)
+            return None
+    except Exception:
+        pass
+    return obj
+
+
 def create_app() -> Flask:
     app = Flask(__name__)
     app.config["TEMPLATES_AUTO_RELOAD"] = True
@@ -454,16 +476,22 @@ def create_app() -> Flask:
             summary, rows = build_report(s.log_dir / "trades.csv", period, frm=frm, to=to)
         except ValueError as e:
             return jsonify({"error": str(e)}), 400
+        except Exception as e:
+            # Never let a bad ledger blank the whole panel with a 500 — return an
+            # empty (but valid) payload with a visible note so the UI still renders.
+            return jsonify({"summary": {}, "trades": [],
+                            "error": f"could not read trade history: {e}"})
         trades = []
         if not rows.empty:
             r = rows.copy()
             if "close_time_utc" in r.columns:
-                r = r.sort_values("close_time_utc")
+                # Newest trade first so the latest close sits on top of the table.
+                r = r.sort_values("close_time_utc", ascending=False)
                 r["close_time_utc"] = r["close_time_utc"].astype(str)
             if "open_time_utc" in r.columns:
                 r["open_time_utc"] = r["open_time_utc"].astype(str)
             trades = r.to_dict(orient="records")
-        return jsonify({"summary": summary.__dict__, "trades": trades})
+        return jsonify(_json_safe({"summary": summary.__dict__, "trades": trades}))
 
     @app.route("/api/candles")
     def api_candles():

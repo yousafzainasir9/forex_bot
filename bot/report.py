@@ -41,7 +41,13 @@ def load_trades(csv_path: str | Path) -> pd.DataFrame:
     path = Path(csv_path)
     if not path.exists():
         return pd.DataFrame()
-    df = pd.read_csv(path)
+    try:
+        df = pd.read_csv(path, on_bad_lines="skip")
+    except Exception:
+        try:
+            df = pd.read_csv(path, on_bad_lines="skip", engine="python")
+        except Exception:
+            return pd.DataFrame()
     if df.empty:
         return df
     for col in ("close_time_utc", "open_time_utc"):
@@ -50,6 +56,9 @@ def load_trades(csv_path: str | Path) -> pd.DataFrame:
     for col in ("pnl", "commission", "swap", "r_multiple", "lots", "entry", "exit"):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
+    for col in ("symbol", "side", "reason_open", "reason_close"):
+        if col in df.columns:
+            df[col] = df[col].fillna("").astype(str)
     return _dedupe_by_position(df)
 
 
