@@ -162,6 +162,18 @@
   </div>
   <div class="panel" style="margin-bottom:18px">
     <h3>Open positions &amp; last signal</h3>
+    <div class="manualTrade" style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:12px">
+      <input id="mtSym" class="btn" style="padding:5px 8px;width:96px" placeholder="SYMBOL"
+             title="Instrument to trade, e.g. EURUSD. Must be offered by your broker."/>
+      <select id="mtSide" class="btn" style="padding:5px 8px"
+              title="BUY = long (profit if price rises); SELL = short (profit if price falls).">
+        <option value="BUY">BUY</option><option value="SELL">SELL</option>
+      </select>
+      <input id="mtLots" class="btn" style="padding:5px 8px;width:96px" placeholder="lots (auto)"
+             title="Leave blank to auto-size by your risk % and ATR stop (recommended). Enter a number to force a lot size."/>
+      <button class="btn go" id="mtBtn">Place trade</button>
+      <span id="mtMsg" class="small" style="margin-left:4px"></span>
+    </div>
     <div id="positions"></div>
     <div id="lastSignal" class="small" style="margin-top:10px"></div>
     <div id="snapAge" class="small" style="margin-top:6px"></div>
@@ -254,6 +266,9 @@ async function refreshStatus(){
   const wl=(cfg.watchlist_size||1);
   const charted=(selectedSym||chartCurSym||snap.symbol||cfg.symbol||"?");
   const chartedLabel=charted+(selectedSym?" (manual)":"");
+  // Prefill the manual-trade symbol box with the charted symbol while it's empty
+  // and the user isn't editing it.
+  const mt=$("mtSym"); if(mt && !mt.value && document.activeElement!==mt && charted!=="?") mt.value=charted;
   $("sym").textContent = wl>1
     ? `${wl} symbols · ${cfg.timeframe||"?"} · charting ${chartedLabel}`
     : `${cfg.symbol||"?"} · ${cfg.timeframe||"?"}`;
@@ -375,6 +390,19 @@ async function closeTrade(ticket, sym){
 $("symSel").onchange=(e)=>{ selectedSym=e.target.value||null; chartFitted=false; lastClosedT=0; forming=null;
   if(candleSeries){ try{candleSeries.setData([]);emaFastS.setData([]);emaSlowS.setData([]);}catch(_){} }
   $("chartMsg").textContent="loading "+(selectedSym||"auto")+"…"; refreshChart(); refreshStatus(); };
+async function placeTrade(){
+  const sym=($("mtSym").value||"").trim().toUpperCase();
+  const side=$("mtSide").value;
+  const lots=($("mtLots").value||"").trim();
+  if(!sym){ $("mtMsg").textContent="enter a symbol first"; return; }
+  if(!confirm(`Place ${side} ${sym}${lots?(" "+lots+" lots"):" (auto-sized)"} at market now?`)) return;
+  $("mtMsg").textContent="placing…";
+  const body={symbol:sym, side:side}; if(lots) body.lots=lots;
+  let r; try{ r=await jpost("/api/control/open",body); }catch(e){ r=null; }
+  if(r && r.ok){ $("mtMsg").textContent="opened ✓ "+(r.detail||""); $("mtLots").value=""; refreshStatus(); refreshTrades(); }
+  else { $("mtMsg").textContent="failed: "+((r&&(r.error||r.detail))||"no response"); }
+}
+$("mtBtn").onclick=placeTrade;
 $("killBtn").onclick=async()=>{const r=await jpost("/api/control/kill",{on:!killOn});killOn=!!r.kill_switch;refreshStatus();};
 $("startBtn").onclick=async()=>{await jpost("/api/control/bot",{action:"start"});setTimeout(refreshStatus,800);};
 $("stopBtn").onclick=async()=>{await jpost("/api/control/bot",{action:"stop"});setTimeout(refreshStatus,800);};

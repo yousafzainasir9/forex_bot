@@ -274,8 +274,13 @@ class Settings:
             ride_stall_atr_frac=_env_float("RIDE_STALL_ATR_FRAC", 0.12),
             partial_tp_enabled=_env_bool("PARTIAL_TP_ENABLED", True),
             partial_tp_fraction=_env_float("PARTIAL_TP_FRACTION", 0.5),
-            partial_tp_r=_env_float("PARTIAL_TP_R", 1.0),
-            lock_profit_r=_env_float("LOCK_PROFIT_R", 0.8),
+            # Default 2.0R (was 1.0R): bank the partial only AFTER the trend-ride
+            # has armed and the move is a clear winner — banking at 1.0R below the
+            # ride-arm point used to choke every runner before it could extend.
+            partial_tp_r=_env_float("PARTIAL_TP_R", 2.0),
+            # Default 0.0R / break-even (was 0.8R): locking +0.8R left an armed
+            # runner almost no breathing room and capped winners near +0.9R.
+            lock_profit_r=_env_float("LOCK_PROFIT_R", 0.0),
             max_bars_in_trade=_env_int("MAX_BARS_IN_TRADE", 0) or 0,
             history_bars=_env_int("HISTORY_BARS", 600) or 600,
             magic_number=_env_int("MAGIC_NUMBER", 250531) or 250531,

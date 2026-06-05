@@ -594,6 +594,142 @@ def create_app() -> Flask:
         return jsonify({"ok": bool(res.ok), "detail": res.detail,
                         "ticket": ticket, "recorded": recorded})
 
+    @app.route("/api/control/open", methods=["POST"])
+    def api_open():
+        """Manually open a position at market from the dashboard (mirror of close).
+
+        Body: {"symbol": "EURUSD", "side": "BUY"|"SELL",
+               "lots"?: float, "sl"?: price, "tp"?: price}
+
+        Sizing/stops default to the SAME risk engine the bot uses (ATR stop, fixed
+        risk %, RR target) so a manual trade carries identical protection — every
+        order still gets an attached stop-loss. Optional ``lots`` overrides the
+        risk-sized volume; optional ``sl``/``tp`` override the computed levels.
+        The trade is tagged with the bot's magic number and written to the open-
+        trade ledger, so if the bot is running it manages the exit (trend-ride /
+        partial / opposite-cross) exactly like an auto entry. The live kill switch
+        DOES block this — opening adds risk (unlike closing, which reduces it)."""
+        import dataclasses
+        body = request.get_json(silent=True) or {}
+        symbol = str(body.get("symbol") or "").strip().upper()
+        side_s = str(body.get("side") or "").strip().upper()
+        if not symbol:
+            return jsonify({"ok": False, "error": "symbol required"}), 400
+        if side_s not in ("BUY", "SELL"):
+            return jsonify({"ok": False, "error": "side must be BUY or SELL"}), 400
+
+        def _optf(name):
+            v = body.get(name)
+            if v in (None, ""):
+                return None
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+        lots_override, sl_override, tp_override = _optf("lots"), _optf("sl"), _optf("tp")
+
+        try:
+            from bot.data import DataFeed, _MT5_AVAILABLE
+            from bot.execution import Executor
+            from bot.indicators import add_indicators
+            from bot.strategy import Action, PositionSide, Signal
+            from bot.risk import RiskManager, DailyState, TradePlan
+            from bot.monitor import Monitor
+            import math
+            if not _MT5_AVAILABLE:
+                return jsonify({"ok": False, "error": "MT5 not available on this host"}), 503
+            s = _settings()
+            # Opening adds risk → honour the live kill switch (close does not).
+            if bool(read_control(s.log_dir).get("kill_switch", False)):
+                return jsonify({"ok": False, "error": "kill switch is ON — new orders blocked"}), 409
+
+            with _MT5_LOCK:
+                feed = DataFeed(s)
+                feed.connect()
+                try:
+                    if not feed.ensure_symbol(symbol):
+                        return jsonify({"ok": False, "error": f"{symbol} not offered by broker"}), 400
+                    candles = feed.get_candles(symbol=symbol, timeframe=s.timeframe,
+                                               n=s.history_bars)
+                    enriched = add_indicators(candles, ema_fast=s.ema_fast, ema_slow=s.ema_slow,
+                                              rsi_period=s.rsi_period, atr_period=s.atr_period,
+                                              adx_period=s.adx_period)
+                    last = enriched.iloc[-1]
+                    atr = float(last["atr"]) if not math.isnan(last["atr"]) else 0.0
+                    price = float(last["close"])
+                    if atr <= 0 and lots_override is None and sl_override is None:
+                        return jsonify({"ok": False, "error": "ATR not ready — pass explicit lots+sl"}), 409
+                    spec = feed.symbol_spec(symbol)
+                    acct = feed.account_info()
+                    side = PositionSide.LONG if side_s == "BUY" else PositionSide.SHORT
+                    sign = 1.0 if side is PositionSide.LONG else -1.0
+
+                    if lots_override is not None:
+                        # Manual size: build the plan directly (still attach a stop).
+                        stop_distance = (abs(price - sl_override) if sl_override is not None
+                                         else atr * s.atr_multiplier)
+                        if stop_distance <= 0:
+                            return jsonify({"ok": False, "error": "stop distance is zero"}), 409
+                        stop_loss = (sl_override if sl_override is not None
+                                     else price - sign * stop_distance)
+                        take_profit = (tp_override if tp_override is not None
+                                       else price + sign * stop_distance * s.risk_reward)
+                        plan = TradePlan(
+                            side=side, entry_price=round(price, spec.digits),
+                            stop_loss=round(stop_loss, spec.digits),
+                            take_profit=round(take_profit, spec.digits),
+                            lots=round(lots_override, 2),
+                            risk_amount=round(lots_override * spec.contract_size * stop_distance, 2),
+                            stop_distance=round(stop_distance, spec.digits),
+                            reason=f"manual {side.value} {round(lots_override, 2)} lots (dashboard)")
+                    else:
+                        # Risk-engine sizing: same path as an auto entry.
+                        sig = Signal(action=Action.BUY if side_s == "BUY" else Action.SELL,
+                                     reason="manual order (dashboard)", price=price, atr=atr,
+                                     rsi=float(last["rsi"]) if not math.isnan(last["rsi"]) else 50.0,
+                                     ema_fast=float(last["ema_fast"]), ema_slow=float(last["ema_slow"]),
+                                     bar_time=enriched.index[-1])
+                        rm = RiskManager(
+                            risk_per_trade=s.risk_per_trade, max_risk_per_trade=s.max_risk_per_trade,
+                            max_daily_loss=s.max_daily_loss, risk_mode=s.risk_mode,
+                            atr_multiplier=s.atr_multiplier, risk_reward=s.risk_reward,
+                            symbol_spec=spec)
+                        # open_positions=0: a deliberate manual trade isn't blocked by the
+                        # auto position-count cap, but the risk %/min-lot veto still applies.
+                        dec = rm.evaluate(sig, equity=acct.equity, open_positions=0,
+                                          daily=DailyState(acct.equity), kill_switch=False,
+                                          is_live=s.is_live, allow_live=s.is_live)
+                        if not (dec.approved and dec.plan is not None):
+                            return jsonify({"ok": False, "error": f"risk veto: {dec.reason}"}), 409
+                        plan = dec.plan
+                        if sl_override is not None or tp_override is not None:
+                            plan = dataclasses.replace(
+                                plan,
+                                stop_loss=round(sl_override, spec.digits) if sl_override is not None else plan.stop_loss,
+                                take_profit=round(tp_override, spec.digits) if tp_override is not None else plan.take_profit)
+
+                    mon = Monitor(s.log_dir, console=False)
+                    execu = Executor(s, monitor=mon)
+                    res = execu.open_position(plan, symbol=symbol)
+                    if res.ok and res.ticket is not None:
+                        try:
+                            pid = execu.find_position_id(res.ticket, symbol=symbol)
+                            mon.note_open(pid, {
+                                "symbol": symbol, "side": plan.side.value,
+                                "stop_loss": plan.stop_loss, "take_profit": plan.take_profit,
+                                "stop_distance": plan.stop_distance, "entry": plan.entry_price,
+                                "risk_amount": plan.risk_amount, "reason_open": plan.reason,
+                                "open_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                            })
+                        except Exception:
+                            pass
+                finally:
+                    feed.shutdown()
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
+        return jsonify({"ok": bool(res.ok), "detail": res.detail, "ticket": res.ticket,
+                        "plan": plan.reason})
+
     @app.route("/api/control/bot", methods=["POST"])
     def api_bot():
         global _bot_proc

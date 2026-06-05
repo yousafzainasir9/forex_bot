@@ -489,6 +489,21 @@ class Bot:
                 return kk, v, m
         return None, {}, m
 
+    @staticmethod
+    def _ratchets_protective(side, new_sl: float, cur_sl: float) -> bool:
+        """True only if moving the stop to ``new_sl`` TIGHTENS protection.
+
+        A long's stop may only move UP, a short's only DOWN; an unset/zero current
+        stop is always improved. This guards the live profit-lock moves so they can
+        never LOOSEN a stop the trend-ride trailing has already pushed further in our
+        favour (the backtester already ratchets via max/min — this brings live into
+        line and removes a real round-trip risk under the new ride-from-1R config)."""
+        if new_sl is None or new_sl <= 0:
+            return False
+        if cur_sl is None or cur_sl <= 0:
+            return True
+        return new_sl > cur_sl if side is PositionSide.LONG else new_sl < cur_sl
+
     def _partial_tp_check(self, p) -> None:
         """Bank part of the position once price reaches the partial target
         (``partial_tp_r`` in R = multiples of the original stop distance), then move
@@ -528,14 +543,22 @@ class Bot:
             m[key] = {**m.get(key, {}), **info}
             self.mon._write_open_map(m)
         # Move the remainder's stop to LOCK lock_profit_r of profit (0 = break-even).
-        lock_sl = (p.entry + sd * self.s.lock_profit_r if p.side is PositionSide.LONG
-                   else p.entry - sd * self.s.lock_profit_r)
+        # Only ratchet it the protective way — never loosen a stop the trend-ride may
+        # already have trailed further in our favour.
+        lock_sl = round((p.entry + sd * self.s.lock_profit_r if p.side is PositionSide.LONG
+                         else p.entry - sd * self.s.lock_profit_r), 5)
+        if not self._ratchets_protective(p.side, lock_sl, float(p.stop_loss or 0.0)):
+            self.mon.info(
+                f"{p.symbol}: partial take-profit — banked {close_vol} lots @ "
+                f"{round(target, 5)} ({self.s.partial_tp_r:g}R); stop already tighter "
+                f"than +{self.s.lock_profit_r:g}R — left as is.")
+            return
         self.mon.info(
             f"{p.symbol}: partial take-profit — banked {close_vol} lots @ "
             f"{round(target, 5)} ({self.s.partial_tp_r:g}R); locking remainder at "
-            f"{round(lock_sl, 5)} (+{self.s.lock_profit_r:g}R).")
+            f"{lock_sl} (+{self.s.lock_profit_r:g}R).")
         try:
-            self.execu.modify_sl_tp(p.ticket, stop_loss=round(lock_sl, 5), take_profit=0.0)
+            self.execu.modify_sl_tp(p.ticket, stop_loss=lock_sl, take_profit=0.0)
         except Exception as e:
             self.mon.warning(f"{p.symbol}: profit-lock move after partial failed: {e}")
 
@@ -599,17 +622,22 @@ class Bot:
             # a winner into a loss. (Without this, removing the TP to ride leaves only
             # the original ATR stop — profit could fully round-trip.)
             sd = float(info.get("stop_distance", 0) or 0)
-            lock_sl = (p.entry + sd * self.s.lock_profit_r if p.side is PositionSide.LONG
-                       else p.entry - sd * self.s.lock_profit_r)
-            try:
-                res = self.execu.modify_sl_tp(p.ticket, stop_loss=round(lock_sl, 5), take_profit=0.0)
-                if res.ok:
-                    self.mon.info(f"{p.symbol}: stop moved to lock +{self.s.lock_profit_r:g}R "
-                                  f"@ {round(lock_sl, 5)} (riding).")
-                else:
-                    self.mon.warning(f"{p.symbol}: profit-lock stop move rejected: {res.detail}")
-            except Exception as e:
-                self.mon.warning(f"{p.symbol}: profit-lock stop move failed: {e}")
+            lock_sl = round((p.entry + sd * self.s.lock_profit_r if p.side is PositionSide.LONG
+                             else p.entry - sd * self.s.lock_profit_r), 5)
+            # Only ratchet protectively — never loosen a stop already trailed further.
+            if not self._ratchets_protective(p.side, lock_sl, float(p.stop_loss or 0.0)):
+                self.mon.info(f"{p.symbol}: target reached — stop already tighter than "
+                              f"+{self.s.lock_profit_r:g}R, left as is (riding).")
+            else:
+                try:
+                    res = self.execu.modify_sl_tp(p.ticket, stop_loss=lock_sl, take_profit=0.0)
+                    if res.ok:
+                        self.mon.info(f"{p.symbol}: stop moved to lock +{self.s.lock_profit_r:g}R "
+                                      f"@ {lock_sl} (riding).")
+                    else:
+                        self.mon.warning(f"{p.symbol}: profit-lock stop move rejected: {res.detail}")
+                except Exception as e:
+                    self.mon.warning(f"{p.symbol}: profit-lock stop move failed: {e}")
 
         # Ongoing ATR trailing while riding: ratchet the broker stop in our favour so
         # a deep reversal gives back less than a full round-trip. Only moves the stop
