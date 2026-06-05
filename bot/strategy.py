@@ -181,6 +181,7 @@ class TrendRideDecision:
     should_close: bool
     tp_reached: bool
     reason: str
+    stall_streak: int = 0
 
 
 def trend_ride_exit(
@@ -192,6 +193,11 @@ def trend_ride_exit(
     last_high: float,
     last_low: float,
     tp_reached: bool,
+    stall_streak: int = 0,
+    bars_to_exit: int = 2,
+    entry: Optional[float] = None,
+    last_close: Optional[float] = None,
+    noise_tol: float = 0.0,
 ) -> TrendRideDecision:
     """Trend-ride exit: once price reaches the take-profit ("upper limit") it does
     NOT close. Instead it rides the move and exits only when the trend turns,
@@ -241,24 +247,47 @@ def trend_ride_exit(
         return TrendRideDecision(False, reached,
                                  "target reached this bar — flagged, holding to next bar")
 
-    # Already armed on an earlier bar: the up-move (LONG) is "over" when a bar
-    # fails to make a higher high; the down-move (SHORT) when it fails a lower low.
+    # Already armed on an earlier bar. The move is only declared "over" after
+    # ``bars_to_exit`` CONSECUTIVE stall bars (a single stall no longer closes the
+    # trade), and the exit only fires if it would bank a PROFIT. Otherwise we keep
+    # riding and let the broker stop-loss / break-even stop cap the downside.
+    # ``noise_tol`` (ATR-relative) ignores a minimal lower-high / higher-low as
+    # market noise so tiny red candles / dojis don't end the ride.
+    tol = max(0.0, float(noise_tol))
     if side is PositionSide.LONG:
-        if last_high < prev_high:
+        stalled = last_high < prev_high - tol
+        riding_reason = "riding LONG trend - still making higher highs"
+    else:
+        stalled = last_low > prev_low + tol
+        riding_reason = "riding SHORT trend - still making lower lows"
+
+    if not stalled:
+        # Move resumed -> reset the stall streak.
+        return TrendRideDecision(False, reached, riding_reason, 0)
+
+    streak = int(stall_streak) + 1
+    if streak < bars_to_exit:
+        return TrendRideDecision(
+            False, reached,
+            f"trend-ride: stall bar {streak}/{bars_to_exit} - holding for confirmation",
+            streak)
+
+    # Enough consecutive stall bars: only exit if doing so banks a profit.
+    if entry is not None and last_close is not None:
+        in_profit = (last_close > entry if side is PositionSide.LONG
+                     else last_close < entry)
+        if not in_profit:
             return TrendRideDecision(
-                True, reached,
-                f"trend-ride exit: LONG bar high {last_high:.5f} below prior high "
-                f"{prev_high:.5f} — up-move over")
-        return TrendRideDecision(False, reached,
-                                 "riding LONG trend — still making higher highs")
-    else:  # SHORT
-        if last_low > prev_low:
-            return TrendRideDecision(
-                True, reached,
-                f"trend-ride exit: SHORT bar low {last_low:.5f} above prior low "
-                f"{prev_low:.5f} — down-move over")
-        return TrendRideDecision(False, reached,
-                                 "riding SHORT trend — still making lower lows")
+                False, reached,
+                f"trend-ride: {streak} stall bars but not in profit "
+                f"(close {last_close:.5f} vs entry {entry:.5f}) - holding; stop protects",
+                streak)
+
+    extreme = "high" if side is PositionSide.LONG else "low"
+    return TrendRideDecision(
+        True, reached,
+        f"trend-ride exit: {streak} consecutive stall {extreme}-bars, in profit - move over",
+        streak)
 
 
 def _signal(action: Action, row: pd.Series, bar_time, reason: str) -> Signal:

@@ -73,13 +73,25 @@ def currencies_of(symbol: str) -> set:
     return {core or (symbol or "").upper().strip()}
 
 
-def exposure_breach(open_symbols, candidate: str, max_per_currency: int) -> bool:
-    """True if opening ``candidate`` would exceed ``max_per_currency`` open positions
-    on any single currency it shares with the already-open ones.
+def exposure_breach(open_symbols, candidate: str, max_per_currency: int,
+                    candidate_action: str = "") -> bool:
+    """Direction-aware correlation cap on opening ``candidate``.
 
-    This stops the scanner from quietly stacking correlated bets — e.g. EURUSD +
-    EURGBP + EURJPY is really three bets on EUR. <= 0 disables the cap.
+    Trader's rules:
+      * LONG candidate (action "BUY") — never blocked here; same-currency longs may
+        stack, limited only by the overall SCAN_TOP_N / MAX_OPEN_POSITIONS count.
+      * SHORT candidate (action "SELL") — at most ONE position per currency: blocked
+        if ANY already-open position (long or short) shares a currency with it.
+      * No action given (legacy callers/tests) — falls back to the original
+        symmetric per-currency count cap using ``max_per_currency`` (<=0 disables).
     """
+    act = (candidate_action or "").upper()
+    if act == "BUY":
+        return False
+    if act == "SELL":
+        cand = currencies_of(candidate)
+        return any(cand & currencies_of(sym) for sym in open_symbols)
+    # --- legacy symmetric cap (back-compat when no direction is supplied) ---
     if max_per_currency <= 0:
         return False
     counts: Dict[str, int] = {}

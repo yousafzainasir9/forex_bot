@@ -461,11 +461,13 @@ class Bot:
                     continue
                 if cand.score < self.s.scan_min_score:
                     continue
-                # Correlation guard: don't stack positions on the same currency.
-                if exposure_breach(open_syms, cand.symbol, self.s.max_per_currency):
+                # Correlation guard (direction-aware): longs may stack on a shared
+                # currency; a short is capped at one position per currency.
+                if exposure_breach(open_syms, cand.symbol, self.s.max_per_currency,
+                                   cand.action):
                     self.mon.info(
-                        f"Skip {cand.symbol}: per-currency exposure cap "
-                        f"({self.s.max_per_currency}) would be exceeded.")
+                        f"Skip {cand.symbol} {cand.action}: a position already shares "
+                        f"a currency (shorts are limited to one per currency).")
                     continue
                 if self._try_open(cand, equity, open_count=len(open_syms), kill=kill):
                     open_syms.add(cand.symbol)
@@ -558,12 +560,32 @@ class Bot:
         if candles is None or len(candles) < 2:
             return
         last, prev = candles.iloc[-1], candles.iloc[-2]
+        # ATR-relative noise band: a minimal lower-high/higher-low (within
+        # RIDE_STALL_ATR_FRAC x ATR) is treated as noise, not a stall bar.
+        try:
+            from bot.indicators import atr as _atr_fn
+            _aser = _atr_fn(candles, self.s.atr_period)
+            _cur_atr = float(_aser.iloc[-1]) if not pd.isna(_aser.iloc[-1]) else 0.0
+        except Exception:
+            _cur_atr = 0.0
         dec = trend_ride_exit(
             side=p.side, take_profit=tp,
             prev_high=float(prev["high"]), prev_low=float(prev["low"]),
             last_high=float(last["high"]), last_low=float(last["low"]),
             tp_reached=bool(info.get("tp_reached", False)),
+            stall_streak=int(info.get("ride_stall", 0) or 0),
+            entry=float(p.entry), last_close=float(last["close"]),
+            noise_tol=self.s.ride_stall_atr_frac * _cur_atr,
         )
+        # Advance the consecutive-stall streak once per NEW closed bar (the loop can
+        # run several times within one M5 bar; only count when the bar changes).
+        _bar_id = str(getattr(last, "name", ""))
+        if key is not None and _bar_id and info.get("ride_last_bar") != _bar_id:
+            info["ride_stall"] = dec.stall_streak
+            info["ride_last_bar"] = _bar_id
+            _m = self.mon._read_open_map()
+            _m[key] = {**_m.get(key, {}), **info}
+            self.mon._write_open_map(_m)
         # Latch the TP-reached state into the bookkeeping file so it survives loops.
         if dec.tp_reached and not info.get("tp_reached") and key is not None:
             info["tp_reached"] = True

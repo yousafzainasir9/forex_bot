@@ -174,6 +174,7 @@ def run_backtest(
     partial_tp_fraction: float = 0.5,
     partial_tp_r: float = 1.0,
     lock_profit_r: float = 0.0,
+    ride_stall_atr_frac: float = 0.0,
     max_bars_in_trade: int = 0,
 ) -> BacktestResult:
     """Replay ``df`` (OHLC, UTC DatetimeIndex) through the live strategy + risk code.
@@ -313,7 +314,12 @@ def run_backtest(
                     prev_high=float(prev_bar["high"]), prev_low=float(prev_bar["low"]),
                     last_high=float(bar["high"]), last_low=float(bar["low"]),
                     tp_reached=pos.get("tp_reached", False),
+                    stall_streak=pos.get("ride_stall", 0),
+                    entry=pos["entry"], last_close=float(bar["close"]),
+                    noise_tol=ride_stall_atr_frac * (
+                        float(bar["atr"]) if not pd.isna(bar["atr"]) else 0.0),
                 )
+                pos["ride_stall"] = dec.stall_streak
                 if dec.tp_reached and not pos.get("tp_reached", False):
                     pos["tp_reached"] = True
                     # Lock lock_profit_r of profit once target hit (0 = break-even).
@@ -414,6 +420,7 @@ def run_backtest(
                         "open_time": enriched.index[i + 1], "reason_open": plan.reason,
                         "tp_reached": False, "stop_distance": dist,
                         "partial_done": False, "entry_i": i + 1,
+                        "ride_stall": 0,
                     }
 
     # Close any still-open position at the last bar's close (mark-to-market exit).
@@ -885,7 +892,8 @@ def main(argv=None) -> int:
                      session_end_hour=sess_end,
                      trail_after_tp=trail, trail_atr_mult=trail_mult,
                      partial_tp_enabled=ptp_on, partial_tp_fraction=ptp_frac,
-                     partial_tp_r=ptp_r, lock_profit_r=lock_r, max_bars_in_trade=max_bars)
+                     partial_tp_r=ptp_r, lock_profit_r=lock_r,
+                     ride_stall_atr_frac=_s.ride_stall_atr_frac, max_bars_in_trade=max_bars)
     print(f"(backtest config: ride_trend={ride}, risk_mode={rmode}, "
           f"htf_gate={htf_gate}, session={session} [{sess_start:02d}-{sess_end:02d} UTC])")
     out_dir = Path(__file__).resolve().parent.parent / "logs"

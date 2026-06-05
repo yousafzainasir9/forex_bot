@@ -171,6 +171,7 @@ class Settings:
     # --- Exit management ---
     trail_after_tp: bool        # once target hit, trail the stop by ATR (on top of break-even)
     trail_atr_mult: float       # trailing-stop distance = ATR x this
+    ride_stall_atr_frac: float  # ignore a lower-high/higher-low within this x ATR as noise (0 = off)
     partial_tp_enabled: bool    # bank part of the position at partial_tp_r, ride the rest
     partial_tp_fraction: float  # fraction of the position to close at the partial target (0..1)
     partial_tp_r: float         # partial target distance, in R (multiples of the stop distance)
@@ -270,6 +271,7 @@ class Settings:
             max_spread_points=_env_int("MAX_SPREAD_POINTS", 0) or 0,
             trail_after_tp=_env_bool("TRAIL_AFTER_TP", True),
             trail_atr_mult=_env_float("TRAIL_ATR_MULT", 1.5),
+            ride_stall_atr_frac=_env_float("RIDE_STALL_ATR_FRAC", 0.12),
             partial_tp_enabled=_env_bool("PARTIAL_TP_ENABLED", True),
             partial_tp_fraction=_env_float("PARTIAL_TP_FRACTION", 0.5),
             partial_tp_r=_env_float("PARTIAL_TP_R", 1.0),

@@ -56,7 +56,7 @@ _live_scan_cache: dict = {"ts": 0.0, "payload": None}
 # How often the web app pulls closed deals from MT5 to backfill trades.csv, and
 # how far back it looks (a wide window is safe — recording is deduped by id).
 _RECON_TTL_SEC = 30.0
-_RECON_LOOKBACK_DAYS = 7
+_RECON_LOOKBACK_DAYS = 365
 _recon_state: dict = {"ts": 0.0}
 
 # Per-symbol cache for charting any watchlist symbol on demand (the bot only

@@ -178,3 +178,30 @@ def test_default_watchlist_used_when_unset(monkeypatch):
 def test_single_keyword_and_csv():
     assert _parse_symbols("SINGLE", "EURUSD") == ["EURUSD"]
     assert _parse_symbols("eurusd, gbpusd; xauusd", "EURUSD") == ["EURUSD", "GBPUSD", "XAUUSD"]
+
+
+# --- direction-aware exposure cap (longs stack; shorts = 1 per currency) ---
+from bot.scanner import exposure_breach as _exposure_breach
+
+
+def test_exposure_long_never_blocked_even_same_currency():
+    # EURUSD long already open; EURGBP long shares EUR but longs may stack.
+    assert _exposure_breach({"EURUSD"}, "EURGBP", 1, "BUY") is False
+    assert _exposure_breach({"EURUSD", "EURJPY"}, "EURGBP", 1, "BUY") is False
+
+
+def test_exposure_short_blocked_when_currency_shared():
+    # A short is capped at one per currency: EURUSD open -> EURGBP SELL shares EUR.
+    assert _exposure_breach({"EURUSD"}, "EURGBP", 99, "SELL") is True
+    # shares USD with an open long, still blocked (any direction counts).
+    assert _exposure_breach({"GBPUSD"}, "USDCHF", 99, "SELL") is True
+
+
+def test_exposure_short_allowed_when_no_shared_currency():
+    assert _exposure_breach({"EURUSD"}, "AUDCAD", 99, "SELL") is False
+
+
+def test_exposure_legacy_symmetric_cap_without_action():
+    # No action supplied -> original per-currency count cap still applies.
+    assert _exposure_breach({"EURUSD"}, "EURGBP", 1) is True
+    assert _exposure_breach({"EURUSD"}, "EURGBP", 2) is False
