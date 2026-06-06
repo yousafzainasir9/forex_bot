@@ -176,6 +176,14 @@ def run_backtest(
     lock_profit_r: float = 0.0,
     ride_stall_atr_frac: float = 0.0,
     max_bars_in_trade: int = 0,
+    require_regime: bool = False,
+    regime_timeframe: str = "D1",
+    regime_ema_fast: int = 10,
+    regime_ema_slow: int = 20,
+    mean_reversion: bool = False,
+    mr_band_k: float = 2.0,
+    mr_stop_atr: float = 2.0,
+    mr_use_rsi: bool = True,
 ) -> BacktestResult:
     """Replay ``df`` (OHLC, UTC DatetimeIndex) through the live strategy + risk code.
 
@@ -208,6 +216,14 @@ def run_backtest(
     htf_trend_series = (
         _causal_htf_trend(enriched, htf_timeframe, params.ema_fast, params.ema_slow)
         if require_htf_align else None
+    )
+    # Slow REGIME gate (e.g. daily 10/20 EMA ≈ the multi-week "big" trend). Only take
+    # longs in an UP regime and shorts in a DOWN regime — the "trade with the big
+    # trend, skip counter-trend scalps" filter. Causal: resampled to regime_timeframe
+    # and forward-filled onto the M5 index exactly like the HTF gate.
+    regime_trend_series = (
+        _causal_htf_trend(enriched, regime_timeframe, regime_ema_fast, regime_ema_slow)
+        if require_regime else None
     )
     risk = RiskManager(
         risk_per_trade=risk_per_trade, max_daily_loss=max_daily_loss,
@@ -245,6 +261,91 @@ def run_backtest(
                 day_start_equity = equity
                 realized_today = 0.0
                 halted = False
+
+        # =====================================================================
+        # MEAN-REVERSION MODE — a deliberately DIFFERENT class of strategy than
+        # the EMA-cross trend follower above. It FADES stretched moves:
+        #   * mean      = EMA(ema_slow)  (the value price is expected to revert to)
+        #   * BUY  when close is >= mr_band_k * ATR BELOW the mean (over-sold),
+        #            optionally also requiring RSI <= rsi_oversold.
+        #   * SELL when close is >= mr_band_k * ATR ABOVE the mean (over-bought),
+        #            optionally also requiring RSI >= rsi_overbought.
+        #   * stop   = mr_stop_atr * ATR beyond entry (room to catch the knife).
+        #   * target = the mean itself (exit when price reverts) — no trend-ride.
+        # Self-contained: it ignores the trend-ride/partial/HTF/regime machinery,
+        # but reuses the SAME realism — next-bar fill, stop-checked-first, costs,
+        # risk-% sizing, daily-loss halt, optional session + time exit.
+        # =====================================================================
+        if mean_reversion:
+            cur = enriched.iloc[i]
+            # 1) manage an open MR position against this bar (stop first, then mean).
+            if pos is not None:
+                exit_price = None
+                reason = None
+                if pos["side"] is PositionSide.LONG:
+                    if bar["low"] <= pos["sl"]:
+                        exit_price, reason = pos["sl"], "SL"
+                    elif bar["high"] >= pos["tp"]:
+                        exit_price, reason = pos["tp"], "mean-revert"
+                else:  # SHORT
+                    if bar["high"] >= pos["sl"]:
+                        exit_price, reason = pos["sl"], "SL"
+                    elif bar["low"] <= pos["tp"]:
+                        exit_price, reason = pos["tp"], "mean-revert"
+                if (exit_price is None and max_bars_in_trade > 0
+                        and (i - pos.get("entry_i", i)) >= max_bars_in_trade):
+                    exit_price, reason = float(bar["close"]), "time-exit"
+                if exit_price is not None:
+                    pnl = _close_pnl(pos, exit_price, spec, costs)
+                    equity += pnl
+                    realized_today += pnl
+                    trades.append(_trade_row(pos, exit_price, bar_time, pnl, reason))
+                    eq_points.append((bar_time, equity))
+                    if daily_obj().loss_fraction() >= max_daily_loss:
+                        halted = True
+                    pos = None
+            # 2) entry: decide on closed bar i, fill at bar i+1 open.
+            if pos is None and not halted and i + 1 < n:
+                mean = float(cur["ema_slow"]) if not pd.isna(cur["ema_slow"]) else float("nan")
+                a = float(cur["atr"]) if not pd.isna(cur["atr"]) else 0.0
+                r = float(cur["rsi"]) if not pd.isna(cur["rsi"]) else 50.0
+                price = float(cur["close"])
+                action = None
+                if a > 0 and mean == mean:
+                    dev = price - mean
+                    if dev <= -mr_band_k * a and (not mr_use_rsi or r <= params.rsi_oversold):
+                        action = Action.BUY
+                    elif dev >= mr_band_k * a and (not mr_use_rsi or r >= params.rsi_overbought):
+                        action = Action.SELL
+                if action is not None and session_filter and has_time and not in_trading_session(
+                        bar_time.hour, session_start_hour, session_end_hour):
+                    action = None
+                if action is not None:
+                    side = PositionSide.LONG if action is Action.BUY else PositionSide.SHORT
+                    dirn = 1.0 if side is PositionSide.LONG else -1.0
+                    nxt = enriched.iloc[i + 1]
+                    entry = float(nxt["open"]) + dirn * (costs.spread_price + costs.slippage_price)
+                    stop_distance = mr_stop_atr * a
+                    sl = entry - dirn * stop_distance
+                    tp = mean  # revert-to-mean target
+                    money_per_lot = spec.contract_size * stop_distance
+                    tp_on_profit_side = (tp > entry) if side is PositionSide.LONG else (tp < entry)
+                    if money_per_lot > 0 and stop_distance > 0 and tp_on_profit_side:
+                        raw_lots = (equity * risk_per_trade) / money_per_lot
+                        lots = float(np.floor(raw_lots / spec.volume_step + 1e-9) * spec.volume_step)
+                        lots = max(spec.volume_min, min(lots, spec.volume_max))
+                        lots = round(lots, 2)
+                        if lots >= spec.volume_min:
+                            pos = {
+                                "side": side, "entry": entry, "sl": sl, "tp": tp,
+                                "lots": lots, "risk_amount": round(lots * money_per_lot, 2),
+                                "open_time": enriched.index[i + 1],
+                                "reason_open": f"MR fade {side.value} @ {round(entry, 5)} "
+                                               f"(dev {round((price - mean) / a, 2)}xATR, target mean {round(mean, 5)})",
+                                "tp_reached": False, "stop_distance": stop_distance,
+                                "partial_done": False, "entry_i": i + 1, "ride_stall": 0,
+                            }
+            continue  # MR mode handled this bar — skip the trend-follower logic below.
 
         # --- 1) manage an open position against THIS bar's range (intrabar) ---
         if pos is not None:
@@ -398,6 +499,12 @@ def run_backtest(
                 want = "UP" if sig.action is Action.BUY else "DOWN"
                 htf_now = htf_trend_series.iloc[i]
                 if htf_now != want:
+                    continue
+            # Slow regime hard-gate: only trade WITH the big (e.g. daily) trend.
+            if sig.action in (Action.BUY, Action.SELL) and require_regime \
+                    and regime_trend_series is not None:
+                want = "UP" if sig.action is Action.BUY else "DOWN"
+                if regime_trend_series.iloc[i] != want:
                     continue
             if sig.action in (Action.BUY, Action.SELL):
                 decision = risk.evaluate(
@@ -849,6 +956,23 @@ def main(argv=None) -> int:
                    help="only enter inside the trading-session hours (default: from .env SESSION_FILTER).")
     p.add_argument("--no-session", dest="session", action="store_false",
                    help="disable the session filter (trade any hour).")
+    p.add_argument("--regime", dest="regime", action="store_true", default=None,
+                   help="require SLOW regime alignment (e.g. daily trend): only longs in "
+                        "an up-regime, shorts in a down-regime. Default: from .env REQUIRE_REGIME.")
+    p.add_argument("--no-regime", dest="regime", action="store_false",
+                   help="disable the slow regime gate.")
+    p.add_argument("--regime-tf", default="D1", help="regime timeframe (default D1).")
+    p.add_argument("--regime-fast", type=int, default=10, help="regime EMA fast (default 10).")
+    p.add_argument("--regime-slow", type=int, default=20, help="regime EMA slow (default 20).")
+    p.add_argument("--mean-reversion", dest="mr", action="store_true",
+                   help="TEST a mean-reversion (fade-the-extreme) entry instead of the EMA-cross "
+                        "trend follower: buy below the mean, sell above it, exit back at the mean.")
+    p.add_argument("--mr-band", type=float, default=2.0,
+                   help="entry stretch in ATRs from the mean (default 2.0).")
+    p.add_argument("--mr-stop", type=float, default=2.0,
+                   help="mean-reversion stop distance in ATRs (default 2.0).")
+    p.add_argument("--mr-no-rsi", dest="mr_rsi", action="store_false",
+                   help="don't also require an RSI extreme for MR entries (default: require it).")
     args = p.parse_args(argv)
 
     if args.csv:
@@ -868,6 +992,8 @@ def main(argv=None) -> int:
     trail, trail_mult = False, 1.5
     ptp_on, ptp_frac, ptp_r = False, 0.5, 1.0
     lock_r, max_bars = 0.0, 0
+    regime = bool(args.regime)
+    ride_stall = 0.0
     try:
         from .config import Settings
         _s = Settings.load()
@@ -880,6 +1006,8 @@ def main(argv=None) -> int:
         trail, trail_mult = _s.trail_after_tp, _s.trail_atr_mult
         ptp_on, ptp_frac, ptp_r = _s.partial_tp_enabled, _s.partial_tp_fraction, _s.partial_tp_r
         lock_r, max_bars = _s.lock_profit_r, _s.max_bars_in_trade
+        ride_stall = _s.ride_stall_atr_frac
+        regime = args.regime if args.regime is not None else getattr(_s, "require_regime", False)
     except Exception:
         ride = bool(args.ride_trend)
         rmode = args.risk_mode or "fixed"
@@ -893,9 +1021,20 @@ def main(argv=None) -> int:
                      trail_after_tp=trail, trail_atr_mult=trail_mult,
                      partial_tp_enabled=ptp_on, partial_tp_fraction=ptp_frac,
                      partial_tp_r=ptp_r, lock_profit_r=lock_r,
-                     ride_stall_atr_frac=_s.ride_stall_atr_frac, max_bars_in_trade=max_bars)
-    print(f"(backtest config: ride_trend={ride}, risk_mode={rmode}, "
-          f"htf_gate={htf_gate}, session={session} [{sess_start:02d}-{sess_end:02d} UTC])")
+                     ride_stall_atr_frac=ride_stall, max_bars_in_trade=max_bars,
+                     require_regime=regime, regime_timeframe=args.regime_tf,
+                     regime_ema_fast=args.regime_fast, regime_ema_slow=args.regime_slow,
+                     mean_reversion=args.mr, mr_band_k=args.mr_band,
+                     mr_stop_atr=args.mr_stop, mr_use_rsi=args.mr_rsi)
+    if args.mr:
+        print(f"(backtest config: MEAN-REVERSION mode | fade {args.mr_band}xATR from EMA(slow) mean, "
+              f"stop {args.mr_stop}xATR, target=mean, rsi_filter={args.mr_rsi}, "
+              f"risk_mode={rmode}, session={session} [{sess_start:02d}-{sess_end:02d} UTC])")
+    else:
+        print(f"(backtest config: ride_trend={ride}, risk_mode={rmode}, "
+              f"htf_gate={htf_gate}, session={session} [{sess_start:02d}-{sess_end:02d} UTC], "
+              f"regime={regime}"
+              f"{f' [{args.regime_tf} {args.regime_fast}/{args.regime_slow}]' if regime else ''})")
     out_dir = Path(__file__).resolve().parent.parent / "logs"
     out_dir.mkdir(parents=True, exist_ok=True)
 

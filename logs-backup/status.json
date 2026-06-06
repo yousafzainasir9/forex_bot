@@ -1,0 +1,34 @@
+{
+  "updated_utc": "2026-06-05T17:21:33+00:00",
+  "running": true,
+  "mode": "DEMO",
+  "symbol": "EURUSD",
+  "primary_symbol": "EURUSD",
+  "watchlist_size": 16,
+  "scan_mode": "top_n",
+  "timeframe": "M5",
+  "kill_switch": false,
+  "equity": 996.85,
+  "balance": 996.85,
+  "currency": "USD",
+  "open_positions": [],
+  "last_signal": null,
+  "daily_realized_pnl": 8.56,
+  "daily_loss_fraction": 0.0,
+  "max_daily_loss": 0.03,
+  "risk": {
+    "mode": "fixed",
+    "per_trade": 0.005,
+    "max_per_trade": 0.02,
+    "daily_stop": 0.03
+  },
+  "stats": {
+    "n_trades": 17,
+    "wins": 8,
+    "losses": 9,
+    "win_rate": 0.4706,
+    "net_pnl": -3.15,
+    "profit_factor": 0.92,
+    "max_drawdown": 16.3
+  }
+}

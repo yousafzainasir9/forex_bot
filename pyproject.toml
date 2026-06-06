@@ -11,6 +11,7 @@ dependencies = [
     "flask>=3.0",
     # MetaTrader5 only installs on Windows with the MT5 terminal present.
     "MetaTrader5>=5.0.45 ; sys_platform == 'win32'",
+    "scikit-learn>=1.7.2",
 ]
 
 [project.optional-dependencies]
